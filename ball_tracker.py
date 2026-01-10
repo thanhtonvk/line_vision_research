@@ -1568,7 +1568,10 @@ class PoseAnalyzer:
 
 class ShotDetector:
     """
-    Detects shot events when ball position is near a person.
+    Detects shot events when:
+    1. Ball position is near a person AND
+    2. Ball changes direction (velocity vector changes significantly)
+
     Analyzes player pose at each shot moment.
     """
 
@@ -1576,7 +1579,9 @@ class ShotDetector:
         self,
         pose_analyzer: PoseAnalyzer,
         proximity_threshold: float = 50.0,
-        min_frames_between_shots: int = 15
+        min_frames_between_shots: int = 15,
+        direction_change_threshold: float = 45.0,
+        velocity_window: int = 3
     ):
         """
         Initialize shot detector.
@@ -1585,10 +1590,14 @@ class ShotDetector:
             pose_analyzer: PoseAnalyzer instance for pose estimation
             proximity_threshold: Max distance (pixels) for ball to be considered "touching" person
             min_frames_between_shots: Cooldown frames between shots for same person
+            direction_change_threshold: Minimum angle change (degrees) to consider as direction change
+            velocity_window: Number of frames to use for velocity calculation
         """
         self.pose_analyzer = pose_analyzer
         self.proximity_threshold = proximity_threshold
         self.min_frames_between_shots = min_frames_between_shots
+        self.direction_change_threshold = direction_change_threshold
+        self.velocity_window = velocity_window
         self.last_shot_frame = {}  # {person_id: frame_index}
 
     def detect_shots(
@@ -1610,29 +1619,161 @@ class ShotDetector:
         """
         shots = []
 
-        for frame_idx, frame_result in enumerate(frame_results):
-            # Skip if no ball or no persons detected
-            if not frame_result.balls or not frame_result.persons:
+        # Extract ball positions for velocity calculation
+        ball_positions = self._extract_ball_positions(frame_results)
+
+        # Detect direction changes
+        direction_changes = self._detect_direction_changes(ball_positions)
+
+        for frame_idx in direction_changes:
+            frame_result = frame_results[frame_idx]
+
+            # Skip if no persons detected at this frame
+            if not frame_result.persons:
                 continue
 
-            # Get primary ball (first one, usually highest confidence)
-            ball = frame_result.balls[0]
+            # Get ball position at direction change
+            ball = frame_result.balls[0] if frame_result.balls else None
+            if ball is None:
+                continue
+
             ball_pos = np.array([ball.x, ball.y])
 
-            # Check each person
+            # Find the person closest to the ball (within threshold)
+            closest_person = None
+            min_distance = float('inf')
+
             for person in frame_result.persons:
-                # Check if ball is touching/near person
                 if self._is_ball_touching_person(ball_pos, person.bbox):
-                    # Check cooldown (prevent duplicate shots)
-                    if self._can_register_shot(person.id, frame_idx):
-                        # Create shot event with pose analysis
-                        shot = self._create_shot_event(
-                            frame_idx, fps, person, ball, frames[frame_idx]
-                        )
-                        shots.append(shot)
-                        self.last_shot_frame[person.id] = frame_idx
+                    # Calculate distance to person center
+                    person_center = np.array([
+                        (person.bbox[0] + person.bbox[2]) / 2,
+                        (person.bbox[1] + person.bbox[3]) / 2
+                    ])
+                    distance = np.linalg.norm(ball_pos - person_center)
+
+                    if distance < min_distance:
+                        min_distance = distance
+                        closest_person = person
+
+            # Register shot if person found and cooldown passed
+            if closest_person is not None:
+                if self._can_register_shot(closest_person.id, frame_idx):
+                    shot = self._create_shot_event(
+                        frame_idx, fps, closest_person, ball, frames[frame_idx]
+                    )
+                    shots.append(shot)
+                    self.last_shot_frame[closest_person.id] = frame_idx
 
         return shots
+
+    def _extract_ball_positions(self, frame_results: List[FrameResult]) -> List[Optional[Tuple[float, float]]]:
+        """
+        Extract ball positions from all frames.
+
+        Returns:
+            List of (x, y) tuples or None for frames without ball
+        """
+        positions = []
+        for fr in frame_results:
+            if fr.balls:
+                positions.append((fr.balls[0].x, fr.balls[0].y))
+            else:
+                positions.append(None)
+        return positions
+
+    def _detect_direction_changes(self, positions: List[Optional[Tuple[float, float]]]) -> List[int]:
+        """
+        Detect frames where ball changes direction.
+
+        A direction change is detected when the angle between
+        incoming velocity vector and outgoing velocity vector
+        exceeds the threshold.
+
+        Args:
+            positions: List of ball positions (x, y) or None
+
+        Returns:
+            List of frame indices where direction changes occur
+        """
+        direction_change_frames = []
+        n = len(positions)
+        w = self.velocity_window
+
+        for i in range(w, n - w):
+            # Get positions before and after current frame
+            pos_before = self._get_valid_positions(positions, i - w, i)
+            pos_after = self._get_valid_positions(positions, i, i + w)
+
+            if len(pos_before) < 2 or len(pos_after) < 2:
+                continue
+
+            # Calculate incoming velocity (average direction before)
+            vel_in = self._calculate_velocity(pos_before)
+            # Calculate outgoing velocity (average direction after)
+            vel_out = self._calculate_velocity(pos_after)
+
+            if vel_in is None or vel_out is None:
+                continue
+
+            # Calculate angle between velocities
+            angle_change = self._angle_between_vectors(vel_in, vel_out)
+
+            # Check if direction change exceeds threshold
+            if angle_change >= self.direction_change_threshold:
+                direction_change_frames.append(i)
+
+        return direction_change_frames
+
+    def _get_valid_positions(
+        self,
+        positions: List[Optional[Tuple[float, float]]],
+        start: int,
+        end: int
+    ) -> List[Tuple[float, float]]:
+        """Get non-None positions in range [start, end)"""
+        valid = []
+        for i in range(start, end):
+            if 0 <= i < len(positions) and positions[i] is not None:
+                valid.append(positions[i])
+        return valid
+
+    def _calculate_velocity(self, positions: List[Tuple[float, float]]) -> Optional[np.ndarray]:
+        """
+        Calculate average velocity vector from a list of positions.
+
+        Returns:
+            Velocity vector [vx, vy] or None if can't calculate
+        """
+        if len(positions) < 2:
+            return None
+
+        # Use first and last position for overall direction
+        p_start = np.array(positions[0])
+        p_end = np.array(positions[-1])
+
+        velocity = p_end - p_start
+        norm = np.linalg.norm(velocity)
+
+        if norm < 1e-6:
+            return None
+
+        return velocity / norm  # Normalize
+
+    def _angle_between_vectors(self, v1: np.ndarray, v2: np.ndarray) -> float:
+        """
+        Calculate angle between two vectors in degrees.
+
+        Args:
+            v1, v2: Normalized velocity vectors
+
+        Returns:
+            Angle in degrees (0-180)
+        """
+        # Dot product of normalized vectors gives cos(angle)
+        dot = np.clip(np.dot(v1, v2), -1.0, 1.0)
+        angle = np.degrees(np.arccos(dot))
+        return angle
 
     def _is_ball_touching_person(self, ball_pos: np.ndarray, bbox: Tuple[int, int, int, int]) -> bool:
         """
