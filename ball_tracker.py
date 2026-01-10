@@ -768,7 +768,7 @@ class PersonTracker:
 
 
 # =============================================================================
-# PERSON ID MERGER (POST-PROCESSING)
+# PERSON ID MERGER (POST-PROCESSING) - COLOR-BASED
 # =============================================================================
 
 class PersonIDMerger:
@@ -777,27 +777,29 @@ class PersonIDMerger:
 
     When tracking loses a person and re-detects them later, they get a new ID.
     This class analyzes all person tracks and merges IDs that belong to the
-    same person based on:
-    1. Appearance similarity (color histogram of upper body)
-    2. Spatial-temporal consistency (similar positions when IDs overlap in time)
-    3. Body size consistency
+    same person based on CLOTHING COLOR:
+    1. Dominant colors of upper body (shirt/jersey)
+    2. Dominant colors of lower body (pants/shorts)
+    3. Color distribution matching
+
+    Two persons with different clothing colors will NOT be merged.
     """
 
     def __init__(
         self,
-        appearance_threshold: float = 0.65,
-        size_ratio_threshold: float = 0.3,
-        min_samples: int = 5
+        color_similarity_threshold: float = 0.85,  # Very strict - must match clothing
+        min_samples: int = 10,
+        n_dominant_colors: int = 3
     ):
         """
         Args:
-            appearance_threshold: Minimum histogram correlation to consider same person
-            size_ratio_threshold: Maximum allowed difference in body size ratio
+            color_similarity_threshold: Minimum color similarity to consider same person (strict)
             min_samples: Minimum samples needed to compute reliable appearance
+            n_dominant_colors: Number of dominant colors to extract
         """
-        self.appearance_threshold = appearance_threshold
-        self.size_ratio_threshold = size_ratio_threshold
+        self.color_similarity_threshold = color_similarity_threshold
         self.min_samples = min_samples
+        self.n_dominant_colors = n_dominant_colors
 
     def merge_ids(
         self,
@@ -806,28 +808,22 @@ class PersonIDMerger:
     ) -> Tuple[List[List[Dict]], Dict[int, int]]:
         """
         Analyze all person detections and merge IDs belonging to same person.
-
-        Args:
-            frames: List of video frames
-            person_results: List of person detections per frame
-
-        Returns:
-            (updated_person_results, id_mapping) where id_mapping maps old_id -> new_id
+        Uses strict color matching to avoid merging different people.
         """
-        # Step 1: Collect appearance features for each ID
-        print("    Collecting appearance features for each person ID...")
-        id_features = self._collect_id_features(frames, person_results)
+        # Step 1: Collect color features for each ID
+        print("    Collecting clothing color features for each person ID...")
+        id_features = self._collect_color_features(frames, person_results)
 
         if len(id_features) <= 1:
             print("    Only 1 or fewer person IDs found, no merging needed")
             return person_results, {}
 
-        # Step 2: Compare all ID pairs and find matches
-        print(f"    Comparing {len(id_features)} person IDs for similarity...")
-        id_pairs_to_merge = self._find_matching_ids(id_features)
+        # Step 2: Compare all ID pairs using strict color matching
+        print(f"    Comparing {len(id_features)} person IDs by clothing color...")
+        id_pairs_to_merge = self._find_color_matching_ids(id_features)
 
         if not id_pairs_to_merge:
-            print("    No IDs to merge found")
+            print("    No IDs with matching clothing colors found")
             return person_results, {}
 
         # Step 3: Build merge groups using Union-Find
@@ -840,29 +836,21 @@ class PersonIDMerger:
             print("    No ID remapping needed")
             return person_results, {}
 
-        print(f"    Merging {len(id_mapping)} IDs into {len(set(id_mapping.values()))} unique persons")
+        print(f"    Merging {len(id_mapping)} IDs based on clothing color match")
 
         # Step 5: Apply mapping to results
         updated_results = self._apply_id_mapping(person_results, id_mapping)
 
         return updated_results, id_mapping
 
-    def _collect_id_features(
+    def _collect_color_features(
         self,
         frames: List[np.ndarray],
         person_results: List[List[Dict]]
     ) -> Dict[int, Dict]:
         """
-        Collect appearance features for each person ID.
-
-        Returns:
-            Dict mapping person_id -> {
-                'histograms': list of histograms,
-                'sizes': list of (width, height),
-                'positions': list of (frame_idx, x, y),
-                'avg_histogram': averaged histogram,
-                'avg_size': (avg_width, avg_height)
-            }
+        Collect clothing color features for each person ID.
+        Extracts dominant colors from upper body (shirt) and lower body (pants).
         """
         id_features: Dict[int, Dict] = {}
 
@@ -875,60 +863,72 @@ class PersonIDMerger:
 
                 if person_id not in id_features:
                     id_features[person_id] = {
-                        'histograms': [],
-                        'sizes': [],
-                        'positions': [],
-                        'frame_ranges': []
+                        'upper_colors': [],  # List of dominant colors from upper body
+                        'lower_colors': [],  # List of dominant colors from lower body
+                        'upper_histograms': [],
+                        'lower_histograms': [],
+                        'frame_ranges': [],
+                        'positions': []
                     }
 
-                # Extract histogram
-                hist = self._extract_appearance_histogram(frame, bbox)
-                if hist is not None:
-                    id_features[person_id]['histograms'].append(hist)
+                # Extract color features
+                upper_colors, lower_colors, upper_hist, lower_hist = \
+                    self._extract_clothing_colors(frame, bbox)
 
-                # Record size
-                w = bbox[2] - bbox[0]
-                h = bbox[3] - bbox[1]
-                id_features[person_id]['sizes'].append((w, h))
+                if upper_colors is not None:
+                    id_features[person_id]['upper_colors'].append(upper_colors)
+                    id_features[person_id]['upper_histograms'].append(upper_hist)
+                if lower_colors is not None:
+                    id_features[person_id]['lower_colors'].append(lower_colors)
+                    id_features[person_id]['lower_histograms'].append(lower_hist)
 
-                # Record position
+                id_features[person_id]['frame_ranges'].append(frame_idx)
                 id_features[person_id]['positions'].append(
                     (frame_idx, person["x"], person["y"])
                 )
 
-                # Track frame range
-                id_features[person_id]['frame_ranges'].append(frame_idx)
-
-        # Compute averages
+        # Compute average/representative colors for each ID
         for person_id, features in id_features.items():
-            if features['histograms']:
-                # Average histogram
-                avg_hist = np.mean(features['histograms'], axis=0).astype(np.float32)
-                cv2.normalize(avg_hist, avg_hist)
-                features['avg_histogram'] = avg_hist
-            else:
-                features['avg_histogram'] = None
-
-            if features['sizes']:
-                avg_w = np.mean([s[0] for s in features['sizes']])
-                avg_h = np.mean([s[1] for s in features['sizes']])
-                features['avg_size'] = (avg_w, avg_h)
-            else:
-                features['avg_size'] = (0, 0)
-
-            # Frame range
-            features['first_frame'] = min(features['frame_ranges'])
-            features['last_frame'] = max(features['frame_ranges'])
             features['total_detections'] = len(features['frame_ranges'])
+
+            # Average upper body histogram
+            if features['upper_histograms']:
+                avg_upper = np.mean(features['upper_histograms'], axis=0).astype(np.float32)
+                cv2.normalize(avg_upper, avg_upper)
+                features['avg_upper_hist'] = avg_upper
+                features['dominant_upper'] = self._get_average_dominant_colors(
+                    features['upper_colors']
+                )
+            else:
+                features['avg_upper_hist'] = None
+                features['dominant_upper'] = None
+
+            # Average lower body histogram
+            if features['lower_histograms']:
+                avg_lower = np.mean(features['lower_histograms'], axis=0).astype(np.float32)
+                cv2.normalize(avg_lower, avg_lower)
+                features['avg_lower_hist'] = avg_lower
+                features['dominant_lower'] = self._get_average_dominant_colors(
+                    features['lower_colors']
+                )
+            else:
+                features['avg_lower_hist'] = None
+                features['dominant_lower'] = None
 
         return id_features
 
-    def _extract_appearance_histogram(
+    def _extract_clothing_colors(
         self,
         frame: np.ndarray,
         bbox: Tuple[int, int, int, int]
-    ) -> Optional[np.ndarray]:
-        """Extract color histogram from person crop."""
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray],
+               Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        Extract dominant colors from upper body (shirt) and lower body (pants).
+
+        Returns:
+            (upper_dominant_colors, lower_dominant_colors, upper_hist, lower_hist)
+        """
         x1, y1, x2, y2 = bbox
         h, w = frame.shape[:2]
 
@@ -937,38 +937,102 @@ class PersonIDMerger:
         x2, y2 = min(w, x2), min(h, y2)
 
         if x2 <= x1 or y2 <= y1:
-            return None
+            return None, None, None, None
 
         crop = frame[y1:y2, x1:x2]
+        crop_h, crop_w = crop.shape[:2]
 
-        if crop.size == 0:
-            return None
+        if crop.size == 0 or crop_h < 20:
+            return None, None, None, None
 
+        # Split into upper (shirt) and lower (pants) regions
+        # Upper: 20% to 50% of height (avoid head)
+        # Lower: 50% to 80% of height (avoid feet)
+        upper_start = int(crop_h * 0.2)
+        upper_end = int(crop_h * 0.5)
+        lower_start = int(crop_h * 0.5)
+        lower_end = int(crop_h * 0.8)
+
+        # Also crop horizontally to focus on body center (avoid arms at sides)
+        center_start = int(crop_w * 0.25)
+        center_end = int(crop_w * 0.75)
+
+        upper_region = crop[upper_start:upper_end, center_start:center_end]
+        lower_region = crop[lower_start:lower_end, center_start:center_end]
+
+        upper_colors = None
+        lower_colors = None
+        upper_hist = None
+        lower_hist = None
+
+        # Extract upper body colors
+        if upper_region.size > 0 and upper_region.shape[0] > 5 and upper_region.shape[1] > 5:
+            upper_colors = self._extract_dominant_colors(upper_region)
+            upper_hsv = cv2.cvtColor(upper_region, cv2.COLOR_BGR2HSV)
+            upper_hist = cv2.calcHist([upper_hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
+            cv2.normalize(upper_hist, upper_hist)
+
+        # Extract lower body colors
+        if lower_region.size > 0 and lower_region.shape[0] > 5 and lower_region.shape[1] > 5:
+            lower_colors = self._extract_dominant_colors(lower_region)
+            lower_hsv = cv2.cvtColor(lower_region, cv2.COLOR_BGR2HSV)
+            lower_hist = cv2.calcHist([lower_hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
+            cv2.normalize(lower_hist, lower_hist)
+
+        return upper_colors, lower_colors, upper_hist, lower_hist
+
+    def _extract_dominant_colors(self, region: np.ndarray) -> np.ndarray:
+        """
+        Extract dominant colors from a region using k-means clustering.
+        Returns colors in HSV format for better color comparison.
+        """
         # Convert to HSV
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
 
-        # Use upper body (more distinctive - contains shirt/jersey)
-        upper_h = crop.shape[0] // 2
-        if upper_h > 10:
-            hsv_upper = hsv[:upper_h, :, :]
-        else:
-            hsv_upper = hsv
+        # Reshape to list of pixels
+        pixels = hsv.reshape(-1, 3).astype(np.float32)
 
-        # Compute histogram with more bins for better discrimination
-        hist = cv2.calcHist([hsv_upper], [0, 1], None, [36, 48], [0, 180, 0, 256])
-        cv2.normalize(hist, hist)
+        # Remove very dark or very bright pixels (likely shadows or highlights)
+        mask = (pixels[:, 2] > 30) & (pixels[:, 2] < 250)
+        pixels = pixels[mask]
 
-        return hist
+        if len(pixels) < self.n_dominant_colors * 10:
+            # Not enough valid pixels
+            return np.zeros((self.n_dominant_colors, 3), dtype=np.float32)
 
-    def _find_matching_ids(
+        # K-means clustering to find dominant colors
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+        _, labels, centers = cv2.kmeans(
+            pixels, self.n_dominant_colors, None, criteria, 3, cv2.KMEANS_PP_CENTERS
+        )
+
+        # Sort by frequency (most common first)
+        _, counts = np.unique(labels, return_counts=True)
+        sorted_indices = np.argsort(-counts)
+        sorted_centers = centers[sorted_indices]
+
+        return sorted_centers
+
+    def _get_average_dominant_colors(
+        self,
+        color_samples: List[np.ndarray]
+    ) -> np.ndarray:
+        """Average dominant colors across multiple samples."""
+        if not color_samples:
+            return np.zeros((self.n_dominant_colors, 3), dtype=np.float32)
+
+        # Stack all samples
+        stacked = np.array(color_samples)
+        # Average across samples for each dominant color
+        return np.mean(stacked, axis=0).astype(np.float32)
+
+    def _find_color_matching_ids(
         self,
         id_features: Dict[int, Dict]
     ) -> List[Tuple[int, int, float]]:
         """
-        Compare all ID pairs and find matching ones.
-
-        Returns:
-            List of (id1, id2, similarity_score) for pairs that should be merged
+        Compare all ID pairs using strict clothing color matching.
+        Only pairs with very similar clothing colors will be merged.
         """
         matching_pairs = []
         ids = list(id_features.keys())
@@ -984,98 +1048,138 @@ class PersonIDMerger:
                     feat2['total_detections'] < self.min_samples):
                     continue
 
-                # Skip if they significantly overlap in time (likely different persons)
+                # CRITICAL: Skip if they overlap in time - definitely different persons
                 overlap = self._compute_temporal_overlap(feat1, feat2)
-                if overlap > 0.5:  # More than 50% overlap = different persons
+                if overlap > 0.1:  # Even 10% overlap means different persons
                     continue
 
-                # Compare appearance
-                appearance_sim = self._compare_appearance(feat1, feat2)
-                if appearance_sim < self.appearance_threshold:
-                    continue
+                # Compare clothing colors strictly
+                color_score = self._compare_clothing_colors(feat1, feat2)
 
-                # Compare body size
-                size_sim = self._compare_size(feat1, feat2)
-                if size_sim < (1 - self.size_ratio_threshold):
-                    continue
+                # Print debug info
+                # print(f"    ID {id1} vs ID {id2}: color_score={color_score:.3f}")
 
-                # Combined score
-                combined_score = 0.7 * appearance_sim + 0.3 * size_sim
-
-                if combined_score >= self.appearance_threshold:
-                    matching_pairs.append((id1, id2, combined_score))
+                if color_score >= self.color_similarity_threshold:
+                    matching_pairs.append((id1, id2, color_score))
 
         # Sort by score (highest first)
         matching_pairs.sort(key=lambda x: x[2], reverse=True)
 
         return matching_pairs
 
-    def _compute_temporal_overlap(
+    def _compare_clothing_colors(self, feat1: Dict, feat2: Dict) -> float:
+        """
+        Compare clothing colors between two IDs.
+        Requires BOTH upper and lower body colors to match.
+        """
+        scores = []
+
+        # Compare upper body (shirt) histogram
+        if feat1['avg_upper_hist'] is not None and feat2['avg_upper_hist'] is not None:
+            upper_hist_sim = cv2.compareHist(
+                feat1['avg_upper_hist'],
+                feat2['avg_upper_hist'],
+                cv2.HISTCMP_CORREL
+            )
+            upper_hist_sim = max(0, upper_hist_sim)
+
+            # Also compare dominant colors
+            if feat1['dominant_upper'] is not None and feat2['dominant_upper'] is not None:
+                upper_color_sim = self._compare_dominant_colors(
+                    feat1['dominant_upper'],
+                    feat2['dominant_upper']
+                )
+                # Combine histogram and dominant color similarity
+                upper_score = 0.5 * upper_hist_sim + 0.5 * upper_color_sim
+            else:
+                upper_score = upper_hist_sim
+
+            scores.append(upper_score)
+
+        # Compare lower body (pants) histogram
+        if feat1['avg_lower_hist'] is not None and feat2['avg_lower_hist'] is not None:
+            lower_hist_sim = cv2.compareHist(
+                feat1['avg_lower_hist'],
+                feat2['avg_lower_hist'],
+                cv2.HISTCMP_CORREL
+            )
+            lower_hist_sim = max(0, lower_hist_sim)
+
+            # Also compare dominant colors
+            if feat1['dominant_lower'] is not None and feat2['dominant_lower'] is not None:
+                lower_color_sim = self._compare_dominant_colors(
+                    feat1['dominant_lower'],
+                    feat2['dominant_lower']
+                )
+                lower_score = 0.5 * lower_hist_sim + 0.5 * lower_color_sim
+            else:
+                lower_score = lower_hist_sim
+
+            scores.append(lower_score)
+
+        if not scores:
+            return 0.0
+
+        # Return MINIMUM score - both upper and lower must match well
+        # This prevents merging people with same shirt but different pants (or vice versa)
+        return min(scores)
+
+    def _compare_dominant_colors(
         self,
-        feat1: Dict,
-        feat2: Dict
+        colors1: np.ndarray,
+        colors2: np.ndarray
     ) -> float:
         """
+        Compare two sets of dominant colors.
+        Uses HSV distance with special handling for Hue (circular).
+        """
+        if colors1 is None or colors2 is None:
+            return 0.0
+
+        total_similarity = 0.0
+        n_colors = min(len(colors1), len(colors2), self.n_dominant_colors)
+
+        for i in range(n_colors):
+            c1 = colors1[i]
+            c2 = colors2[i]
+
+            # Hue distance (circular, max 90 for opposite colors)
+            h_diff = min(abs(c1[0] - c2[0]), 180 - abs(c1[0] - c2[0]))
+            h_sim = 1.0 - (h_diff / 90.0)
+
+            # Saturation difference
+            s_diff = abs(c1[1] - c2[1]) / 255.0
+            s_sim = 1.0 - s_diff
+
+            # Value difference
+            v_diff = abs(c1[2] - c2[2]) / 255.0
+            v_sim = 1.0 - v_diff
+
+            # Weighted combination (Hue is most important for color matching)
+            color_sim = 0.5 * h_sim + 0.3 * s_sim + 0.2 * v_sim
+            total_similarity += color_sim
+
+        return total_similarity / n_colors if n_colors > 0 else 0.0
+
+    def _compute_temporal_overlap(self, feat1: Dict, feat2: Dict) -> float:
+        """
         Compute how much two IDs overlap in time.
-        Returns ratio of overlap frames to total frames.
+        Any overlap strongly suggests they are different persons.
         """
         frames1 = set(feat1['frame_ranges'])
         frames2 = set(feat2['frame_ranges'])
 
         overlap = len(frames1 & frames2)
-        total = len(frames1 | frames2)
+        min_frames = min(len(frames1), len(frames2))
 
-        return overlap / total if total > 0 else 0
-
-    def _compare_appearance(self, feat1: Dict, feat2: Dict) -> float:
-        """Compare appearance histograms between two IDs."""
-        if feat1['avg_histogram'] is None or feat2['avg_histogram'] is None:
-            return 0.0
-
-        # Use correlation for comparison
-        similarity = cv2.compareHist(
-            feat1['avg_histogram'],
-            feat2['avg_histogram'],
-            cv2.HISTCMP_CORREL
-        )
-
-        return max(0, similarity)
-
-    def _compare_size(self, feat1: Dict, feat2: Dict) -> float:
-        """Compare body sizes between two IDs."""
-        w1, h1 = feat1['avg_size']
-        w2, h2 = feat2['avg_size']
-
-        if w1 == 0 or h1 == 0 or w2 == 0 or h2 == 0:
-            return 0.5  # Unknown, assume neutral
-
-        # Compare aspect ratios and areas
-        ratio1 = w1 / h1
-        ratio2 = w2 / h2
-        ratio_diff = abs(ratio1 - ratio2) / max(ratio1, ratio2)
-
-        area1 = w1 * h1
-        area2 = w2 * h2
-        area_diff = abs(area1 - area2) / max(area1, area2)
-
-        # Score: 1 means identical, 0 means very different
-        ratio_score = 1 - min(ratio_diff, 1)
-        area_score = 1 - min(area_diff, 1)
-
-        return 0.5 * ratio_score + 0.5 * area_score
+        return overlap / min_frames if min_frames > 0 else 0
 
     def _build_merge_groups(
         self,
-        all_ids: List[int],
+        all_ids,
         pairs_to_merge: List[Tuple[int, int, float]]
     ) -> List[List[int]]:
-        """
-        Build groups of IDs that should be merged using Union-Find.
-
-        Returns:
-            List of groups, each group is a list of IDs to merge
-        """
-        # Union-Find implementation
+        """Build groups of IDs that should be merged using Union-Find."""
         parent = {id_: id_ for id_ in all_ids}
 
         def find(x):
@@ -1086,17 +1190,14 @@ class PersonIDMerger:
         def union(x, y):
             px, py = find(x), find(y)
             if px != py:
-                # Keep the smaller ID as parent (for consistency)
                 if px < py:
                     parent[py] = px
                 else:
                     parent[px] = py
 
-        # Apply merges
         for id1, id2, _ in pairs_to_merge:
             union(id1, id2)
 
-        # Build groups
         groups: Dict[int, List[int]] = {}
         for id_ in all_ids:
             root = find(id_)
@@ -1104,28 +1205,16 @@ class PersonIDMerger:
                 groups[root] = []
             groups[root].append(id_)
 
-        # Only return groups with more than 1 member
         return [sorted(group) for group in groups.values() if len(group) > 1]
 
-    def _create_id_mapping(
-        self,
-        merge_groups: List[List[int]]
-    ) -> Dict[int, int]:
-        """
-        Create mapping from old IDs to new IDs.
-        Each group gets the smallest ID in the group.
-
-        Returns:
-            Dict mapping old_id -> new_id (only for IDs that change)
-        """
+    def _create_id_mapping(self, merge_groups: List[List[int]]) -> Dict[int, int]:
+        """Create mapping from old IDs to new IDs."""
         mapping = {}
-
         for group in merge_groups:
-            target_id = min(group)  # Use smallest ID as the canonical one
+            target_id = min(group)
             for id_ in group:
                 if id_ != target_id:
                     mapping[id_] = target_id
-
         return mapping
 
     def _apply_id_mapping(
@@ -1135,7 +1224,6 @@ class PersonIDMerger:
     ) -> List[List[Dict]]:
         """Apply ID mapping to all person results."""
         updated_results = []
-
         for frame_persons in person_results:
             updated_frame = []
             for person in frame_persons:
