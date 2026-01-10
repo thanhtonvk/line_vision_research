@@ -386,15 +386,12 @@ class PersonDetector:
 
     def detect(self, frame: np.ndarray) -> List[Dict]:
         """
-        Detect persons in frame using tile-based approach
+        Detect persons in frame
 
         Returns:
             List of detections: [{x, y, w, h, conf, bbox}, ...]
         """
-        if self.use_tiles:
-            return self._detect_with_tiles(frame)
-        else:
-            return self._detect_single(frame)
+        return self._detect_single(frame)
 
     def _detect_single(self, frame: np.ndarray) -> List[Dict]:
         """Detect on full frame"""
