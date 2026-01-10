@@ -12,6 +12,7 @@ Enhanced features for full court wide-angle videos:
 - Kalman filter for motion prediction
 - Person detection with tile-based approach for accuracy
 - Person tracking with appearance-based ReID to prevent ID switches
+- Post-processing ID merger to consolidate fragmented person IDs
 """
 
 import cv2
@@ -767,6 +768,388 @@ class PersonTracker:
 
 
 # =============================================================================
+# PERSON ID MERGER (POST-PROCESSING)
+# =============================================================================
+
+class PersonIDMerger:
+    """
+    Post-processing class to merge fragmented person IDs.
+
+    When tracking loses a person and re-detects them later, they get a new ID.
+    This class analyzes all person tracks and merges IDs that belong to the
+    same person based on:
+    1. Appearance similarity (color histogram of upper body)
+    2. Spatial-temporal consistency (similar positions when IDs overlap in time)
+    3. Body size consistency
+    """
+
+    def __init__(
+        self,
+        appearance_threshold: float = 0.65,
+        size_ratio_threshold: float = 0.3,
+        min_samples: int = 5
+    ):
+        """
+        Args:
+            appearance_threshold: Minimum histogram correlation to consider same person
+            size_ratio_threshold: Maximum allowed difference in body size ratio
+            min_samples: Minimum samples needed to compute reliable appearance
+        """
+        self.appearance_threshold = appearance_threshold
+        self.size_ratio_threshold = size_ratio_threshold
+        self.min_samples = min_samples
+
+    def merge_ids(
+        self,
+        frames: List[np.ndarray],
+        person_results: List[List[Dict]]
+    ) -> Tuple[List[List[Dict]], Dict[int, int]]:
+        """
+        Analyze all person detections and merge IDs belonging to same person.
+
+        Args:
+            frames: List of video frames
+            person_results: List of person detections per frame
+
+        Returns:
+            (updated_person_results, id_mapping) where id_mapping maps old_id -> new_id
+        """
+        # Step 1: Collect appearance features for each ID
+        print("    Collecting appearance features for each person ID...")
+        id_features = self._collect_id_features(frames, person_results)
+
+        if len(id_features) <= 1:
+            print("    Only 1 or fewer person IDs found, no merging needed")
+            return person_results, {}
+
+        # Step 2: Compare all ID pairs and find matches
+        print(f"    Comparing {len(id_features)} person IDs for similarity...")
+        id_pairs_to_merge = self._find_matching_ids(id_features)
+
+        if not id_pairs_to_merge:
+            print("    No IDs to merge found")
+            return person_results, {}
+
+        # Step 3: Build merge groups using Union-Find
+        merge_groups = self._build_merge_groups(id_features.keys(), id_pairs_to_merge)
+
+        # Step 4: Create ID mapping (old_id -> new_id)
+        id_mapping = self._create_id_mapping(merge_groups)
+
+        if not id_mapping:
+            print("    No ID remapping needed")
+            return person_results, {}
+
+        print(f"    Merging {len(id_mapping)} IDs into {len(set(id_mapping.values()))} unique persons")
+
+        # Step 5: Apply mapping to results
+        updated_results = self._apply_id_mapping(person_results, id_mapping)
+
+        return updated_results, id_mapping
+
+    def _collect_id_features(
+        self,
+        frames: List[np.ndarray],
+        person_results: List[List[Dict]]
+    ) -> Dict[int, Dict]:
+        """
+        Collect appearance features for each person ID.
+
+        Returns:
+            Dict mapping person_id -> {
+                'histograms': list of histograms,
+                'sizes': list of (width, height),
+                'positions': list of (frame_idx, x, y),
+                'avg_histogram': averaged histogram,
+                'avg_size': (avg_width, avg_height)
+            }
+        """
+        id_features: Dict[int, Dict] = {}
+
+        for frame_idx, persons in enumerate(person_results):
+            frame = frames[frame_idx]
+
+            for person in persons:
+                person_id = person["id"]
+                bbox = person["bbox"]
+
+                if person_id not in id_features:
+                    id_features[person_id] = {
+                        'histograms': [],
+                        'sizes': [],
+                        'positions': [],
+                        'frame_ranges': []
+                    }
+
+                # Extract histogram
+                hist = self._extract_appearance_histogram(frame, bbox)
+                if hist is not None:
+                    id_features[person_id]['histograms'].append(hist)
+
+                # Record size
+                w = bbox[2] - bbox[0]
+                h = bbox[3] - bbox[1]
+                id_features[person_id]['sizes'].append((w, h))
+
+                # Record position
+                id_features[person_id]['positions'].append(
+                    (frame_idx, person["x"], person["y"])
+                )
+
+                # Track frame range
+                id_features[person_id]['frame_ranges'].append(frame_idx)
+
+        # Compute averages
+        for person_id, features in id_features.items():
+            if features['histograms']:
+                # Average histogram
+                avg_hist = np.mean(features['histograms'], axis=0).astype(np.float32)
+                cv2.normalize(avg_hist, avg_hist)
+                features['avg_histogram'] = avg_hist
+            else:
+                features['avg_histogram'] = None
+
+            if features['sizes']:
+                avg_w = np.mean([s[0] for s in features['sizes']])
+                avg_h = np.mean([s[1] for s in features['sizes']])
+                features['avg_size'] = (avg_w, avg_h)
+            else:
+                features['avg_size'] = (0, 0)
+
+            # Frame range
+            features['first_frame'] = min(features['frame_ranges'])
+            features['last_frame'] = max(features['frame_ranges'])
+            features['total_detections'] = len(features['frame_ranges'])
+
+        return id_features
+
+    def _extract_appearance_histogram(
+        self,
+        frame: np.ndarray,
+        bbox: Tuple[int, int, int, int]
+    ) -> Optional[np.ndarray]:
+        """Extract color histogram from person crop."""
+        x1, y1, x2, y2 = bbox
+        h, w = frame.shape[:2]
+
+        # Clamp coordinates
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        crop = frame[y1:y2, x1:x2]
+
+        if crop.size == 0:
+            return None
+
+        # Convert to HSV
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+
+        # Use upper body (more distinctive - contains shirt/jersey)
+        upper_h = crop.shape[0] // 2
+        if upper_h > 10:
+            hsv_upper = hsv[:upper_h, :, :]
+        else:
+            hsv_upper = hsv
+
+        # Compute histogram with more bins for better discrimination
+        hist = cv2.calcHist([hsv_upper], [0, 1], None, [36, 48], [0, 180, 0, 256])
+        cv2.normalize(hist, hist)
+
+        return hist
+
+    def _find_matching_ids(
+        self,
+        id_features: Dict[int, Dict]
+    ) -> List[Tuple[int, int, float]]:
+        """
+        Compare all ID pairs and find matching ones.
+
+        Returns:
+            List of (id1, id2, similarity_score) for pairs that should be merged
+        """
+        matching_pairs = []
+        ids = list(id_features.keys())
+
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                id1, id2 = ids[i], ids[j]
+                feat1 = id_features[id1]
+                feat2 = id_features[id2]
+
+                # Skip if either has too few samples
+                if (feat1['total_detections'] < self.min_samples or
+                    feat2['total_detections'] < self.min_samples):
+                    continue
+
+                # Skip if they significantly overlap in time (likely different persons)
+                overlap = self._compute_temporal_overlap(feat1, feat2)
+                if overlap > 0.5:  # More than 50% overlap = different persons
+                    continue
+
+                # Compare appearance
+                appearance_sim = self._compare_appearance(feat1, feat2)
+                if appearance_sim < self.appearance_threshold:
+                    continue
+
+                # Compare body size
+                size_sim = self._compare_size(feat1, feat2)
+                if size_sim < (1 - self.size_ratio_threshold):
+                    continue
+
+                # Combined score
+                combined_score = 0.7 * appearance_sim + 0.3 * size_sim
+
+                if combined_score >= self.appearance_threshold:
+                    matching_pairs.append((id1, id2, combined_score))
+
+        # Sort by score (highest first)
+        matching_pairs.sort(key=lambda x: x[2], reverse=True)
+
+        return matching_pairs
+
+    def _compute_temporal_overlap(
+        self,
+        feat1: Dict,
+        feat2: Dict
+    ) -> float:
+        """
+        Compute how much two IDs overlap in time.
+        Returns ratio of overlap frames to total frames.
+        """
+        frames1 = set(feat1['frame_ranges'])
+        frames2 = set(feat2['frame_ranges'])
+
+        overlap = len(frames1 & frames2)
+        total = len(frames1 | frames2)
+
+        return overlap / total if total > 0 else 0
+
+    def _compare_appearance(self, feat1: Dict, feat2: Dict) -> float:
+        """Compare appearance histograms between two IDs."""
+        if feat1['avg_histogram'] is None or feat2['avg_histogram'] is None:
+            return 0.0
+
+        # Use correlation for comparison
+        similarity = cv2.compareHist(
+            feat1['avg_histogram'],
+            feat2['avg_histogram'],
+            cv2.HISTCMP_CORREL
+        )
+
+        return max(0, similarity)
+
+    def _compare_size(self, feat1: Dict, feat2: Dict) -> float:
+        """Compare body sizes between two IDs."""
+        w1, h1 = feat1['avg_size']
+        w2, h2 = feat2['avg_size']
+
+        if w1 == 0 or h1 == 0 or w2 == 0 or h2 == 0:
+            return 0.5  # Unknown, assume neutral
+
+        # Compare aspect ratios and areas
+        ratio1 = w1 / h1
+        ratio2 = w2 / h2
+        ratio_diff = abs(ratio1 - ratio2) / max(ratio1, ratio2)
+
+        area1 = w1 * h1
+        area2 = w2 * h2
+        area_diff = abs(area1 - area2) / max(area1, area2)
+
+        # Score: 1 means identical, 0 means very different
+        ratio_score = 1 - min(ratio_diff, 1)
+        area_score = 1 - min(area_diff, 1)
+
+        return 0.5 * ratio_score + 0.5 * area_score
+
+    def _build_merge_groups(
+        self,
+        all_ids: List[int],
+        pairs_to_merge: List[Tuple[int, int, float]]
+    ) -> List[List[int]]:
+        """
+        Build groups of IDs that should be merged using Union-Find.
+
+        Returns:
+            List of groups, each group is a list of IDs to merge
+        """
+        # Union-Find implementation
+        parent = {id_: id_ for id_ in all_ids}
+
+        def find(x):
+            if parent[x] != x:
+                parent[x] = find(parent[x])
+            return parent[x]
+
+        def union(x, y):
+            px, py = find(x), find(y)
+            if px != py:
+                # Keep the smaller ID as parent (for consistency)
+                if px < py:
+                    parent[py] = px
+                else:
+                    parent[px] = py
+
+        # Apply merges
+        for id1, id2, _ in pairs_to_merge:
+            union(id1, id2)
+
+        # Build groups
+        groups: Dict[int, List[int]] = {}
+        for id_ in all_ids:
+            root = find(id_)
+            if root not in groups:
+                groups[root] = []
+            groups[root].append(id_)
+
+        # Only return groups with more than 1 member
+        return [sorted(group) for group in groups.values() if len(group) > 1]
+
+    def _create_id_mapping(
+        self,
+        merge_groups: List[List[int]]
+    ) -> Dict[int, int]:
+        """
+        Create mapping from old IDs to new IDs.
+        Each group gets the smallest ID in the group.
+
+        Returns:
+            Dict mapping old_id -> new_id (only for IDs that change)
+        """
+        mapping = {}
+
+        for group in merge_groups:
+            target_id = min(group)  # Use smallest ID as the canonical one
+            for id_ in group:
+                if id_ != target_id:
+                    mapping[id_] = target_id
+
+        return mapping
+
+    def _apply_id_mapping(
+        self,
+        person_results: List[List[Dict]],
+        id_mapping: Dict[int, int]
+    ) -> List[List[Dict]]:
+        """Apply ID mapping to all person results."""
+        updated_results = []
+
+        for frame_persons in person_results:
+            updated_frame = []
+            for person in frame_persons:
+                updated_person = person.copy()
+                old_id = person["id"]
+                if old_id in id_mapping:
+                    updated_person["id"] = id_mapping[old_id]
+                updated_frame.append(updated_person)
+            updated_results.append(updated_frame)
+
+        return updated_results
+
+
+# =============================================================================
 # BALL INTERPOLATOR CLASS
 # =============================================================================
 
@@ -948,7 +1331,8 @@ class TennisBallTracker:
         enable_enhancement: bool = True,
         enable_kalman: bool = True,
         enable_person_detection: bool = True,
-        use_person_tiles: bool = True
+        use_person_tiles: bool = True,
+        enable_person_id_merge: bool = True
     ):
         self.model = YOLO(model_path)
         self.conf_threshold = conf_threshold
@@ -957,6 +1341,7 @@ class TennisBallTracker:
         self.enable_enhancement = enable_enhancement
         self.enable_kalman = enable_kalman
         self.enable_person_detection = enable_person_detection
+        self.enable_person_id_merge = enable_person_id_merge
 
         self.interpolator = BallInterpolator()
         self.validator: Optional[BallValidator] = None
@@ -967,6 +1352,7 @@ class TennisBallTracker:
         # Person detection components
         self.person_detector: Optional[PersonDetector] = None
         self.person_tracker: Optional[PersonTracker] = None
+        self.person_id_merger: Optional[PersonIDMerger] = None
         if enable_person_detection:
             self.person_detector = PersonDetector(
                 model_path=person_model_path,
@@ -974,6 +1360,8 @@ class TennisBallTracker:
                 use_tiles=use_person_tiles
             )
             self.person_tracker = PersonTracker()
+            if enable_person_id_merge:
+                self.person_id_merger = PersonIDMerger()
 
     def process_video(
         self,
@@ -1030,9 +1418,19 @@ class TennisBallTracker:
 
         # 8. Detect and track persons
         person_results = []
+        id_mapping = {}
         if self.enable_person_detection and self.person_detector and self.person_tracker:
             print("Detecting and tracking persons...")
             person_results = self._detect_and_track_persons(frames)
+
+            # 8.5. Post-process: Merge fragmented person IDs
+            if self.enable_person_id_merge and self.person_id_merger:
+                print("Merging fragmented person IDs...")
+                person_results, id_mapping = self.person_id_merger.merge_ids(
+                    frames, person_results
+                )
+                if id_mapping:
+                    print(f"  ID mapping: {id_mapping}")
 
         # 9. Build frame results (balls + persons)
         frame_results = self._build_frame_results(
@@ -1040,7 +1438,7 @@ class TennisBallTracker:
         )
 
         # 10. Calculate statistics
-        stats = self._calculate_statistics(frame_results, raw_detections)
+        stats = self._calculate_statistics(frame_results, raw_detections, id_mapping)
 
         # 11. Save JSON
         print(f"Saving JSON to: {output_json_path}")
@@ -1549,7 +1947,8 @@ class TennisBallTracker:
     def _calculate_statistics(
         self,
         frame_results: List[FrameResult],
-        raw_detections: List[List[Dict]]
+        raw_detections: List[List[Dict]],
+        id_mapping: Dict[int, int] = None
     ) -> Dict:
         """Calculate processing statistics for both balls and persons"""
         # Ball statistics
@@ -1576,6 +1975,10 @@ class TennisBallTracker:
             for p in res.persons:
                 unique_person_ids.add(p.id)
 
+        # ID merge statistics
+        ids_merged = len(id_mapping) if id_mapping else 0
+        original_ids = len(unique_person_ids) + ids_merged
+
         return {
             "ball": {
                 "total_frames": total_frames,
@@ -1588,7 +1991,10 @@ class TennisBallTracker:
             "person": {
                 "frames_with_persons": frames_with_persons,
                 "unique_persons_detected": len(unique_person_ids),
-                "person_ids": sorted(list(unique_person_ids))
+                "person_ids": sorted(list(unique_person_ids)),
+                "ids_before_merge": original_ids,
+                "ids_merged": ids_merged,
+                "id_mapping": id_mapping if id_mapping else {}
             }
         }
 
@@ -1782,8 +2188,9 @@ def main():
     print("  - Kalman filter for ball trajectory prediction")
     print("  - Extended interpolation (up to 30 frames)")
     print("  - Trajectory-based candidate recovery")
-    print("  - Person detection with tile-based approach")
+    print("  - Person detection (full frame)")
     print("  - Person tracking with appearance-based ReID")
+    print("  - Post-processing ID merger (consolidate fragmented IDs)")
     print("=" * 60)
 
     # Create tracker with enhanced settings
@@ -1797,7 +2204,8 @@ def main():
         enable_enhancement=True,      # CLAHE + sharpening for small balls
         enable_kalman=True,           # Kalman filter for trajectory
         enable_person_detection=True, # Enable person detection
-        use_person_tiles=True         # Use tile-based detection for accuracy
+        use_person_tiles=False,       # Full frame detection (not tile-based)
+        enable_person_id_merge=True   # Merge fragmented person IDs
     )
 
     # Process video
@@ -1812,12 +2220,20 @@ def main():
     print("=" * 60)
     print(f"JSON output: {result['output_json']}")
     print(f"Video output: {result['output_video']}")
+
     print("\nBall Statistics:")
     for key, value in result['statistics']['ball'].items():
         print(f"  {key}: {value}")
+
     print("\nPerson Statistics:")
-    for key, value in result['statistics']['person'].items():
-        print(f"  {key}: {value}")
+    person_stats = result['statistics']['person']
+    print(f"  frames_with_persons: {person_stats['frames_with_persons']}")
+    print(f"  unique_persons_detected: {person_stats['unique_persons_detected']}")
+    print(f"  person_ids: {person_stats['person_ids']}")
+    print(f"  ids_before_merge: {person_stats['ids_before_merge']}")
+    print(f"  ids_merged: {person_stats['ids_merged']}")
+    if person_stats['id_mapping']:
+        print(f"  id_mapping: {person_stats['id_mapping']}")
 
 
 if __name__ == "__main__":
