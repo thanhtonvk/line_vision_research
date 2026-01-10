@@ -659,6 +659,57 @@ class PersonDetector:
         """
         return self._detect_single(frame)
 
+    def detect_batch(self, frames: List[np.ndarray], batch_size: int = 32) -> List[List[Dict]]:
+        """
+        Detect persons in multiple frames using batch inference for better performance.
+
+        Args:
+            frames: List of frames to process
+            batch_size: Number of frames to process in each batch
+
+        Returns:
+            List of detection lists, one per frame
+        """
+        all_detections = []
+
+        for i in range(0, len(frames), batch_size):
+            batch = frames[i:i + batch_size]
+
+            # Batch inference - much faster than single frame
+            results = self.model.predict(
+                batch,
+                verbose=False,
+                conf=self.conf_threshold,
+                classes=[self.PERSON_CLASS_ID],
+            )
+
+            # Process results with optimized GPU transfer
+            for res in results:
+                frame_detections = []
+                if res.boxes is not None and len(res.boxes) > 0:
+                    # Batch transfer all tensors to CPU at once (OPTIMIZED)
+                    boxes_xywh = res.boxes.xywh.cpu().numpy()
+                    boxes_conf = res.boxes.conf.cpu().numpy()
+                    boxes_xyxy = res.boxes.xyxy.cpu().numpy().astype(int)
+
+                    for j in range(len(res.boxes)):
+                        x, y, w, h = boxes_xywh[j]
+                        conf = float(boxes_conf[j])
+                        x1, y1, x2, y2 = boxes_xyxy[j]
+
+                        frame_detections.append({
+                            "x": float(x),
+                            "y": float(y),
+                            "w": float(w),
+                            "h": float(h),
+                            "conf": conf,
+                            "bbox": (int(x1), int(y1), int(x2), int(y2)),
+                        })
+
+                all_detections.append(frame_detections)
+
+        return all_detections
+
     def _detect_single(self, frame: np.ndarray) -> List[Dict]:
         """Detect on full frame"""
         results = self.model.predict(
@@ -670,10 +721,15 @@ class PersonDetector:
 
         detections = []
         if results[0].boxes is not None and len(results[0].boxes) > 0:
+            # Batch transfer all tensors to CPU at once (OPTIMIZED)
+            boxes_xywh = results[0].boxes.xywh.cpu().numpy()
+            boxes_conf = results[0].boxes.conf.cpu().numpy()
+            boxes_xyxy = results[0].boxes.xyxy.cpu().numpy().astype(int)
+
             for i in range(len(results[0].boxes)):
-                x, y, w, h = results[0].boxes.xywh[i].cpu().numpy()
-                conf = float(results[0].boxes.conf[i].cpu().numpy())
-                x1, y1, x2, y2 = results[0].boxes.xyxy[i].cpu().numpy().astype(int)
+                x, y, w, h = boxes_xywh[i]
+                conf = float(boxes_conf[i])
+                x1, y1, x2, y2 = boxes_xyxy[i]
 
                 detections.append(
                     {
@@ -721,10 +777,15 @@ class PersonDetector:
             )
 
             if results[0].boxes is not None and len(results[0].boxes) > 0:
+                # Batch transfer all tensors to CPU at once (OPTIMIZED)
+                boxes_xywh = results[0].boxes.xywh.cpu().numpy()
+                boxes_conf = results[0].boxes.conf.cpu().numpy()
+                boxes_xyxy = results[0].boxes.xyxy.cpu().numpy().astype(int)
+
                 for i in range(len(results[0].boxes)):
-                    x, y, w_det, h_det = results[0].boxes.xywh[i].cpu().numpy()
-                    conf = float(results[0].boxes.conf[i].cpu().numpy())
-                    x1, y1, x2, y2 = results[0].boxes.xyxy[i].cpu().numpy().astype(int)
+                    x, y, w_det, h_det = boxes_xywh[i]
+                    conf = float(boxes_conf[i])
+                    x1, y1, x2, y2 = boxes_xyxy[i]
 
                     # Convert to full frame coordinates
                     all_detections.append(
@@ -2187,7 +2248,7 @@ class TennisBallTracker:
         person_model_path: str = "yolov8s.pt",
         conf_threshold: float = 0.15,  # Lower base threshold
         person_conf_threshold: float = 0.5,
-        batch_size: int = 16,
+        batch_size: int = 32,
         enable_validation: bool = True,
         enable_enhancement: bool = True,
         enable_kalman: bool = True,
@@ -2345,24 +2406,26 @@ class TennisBallTracker:
 
     def _detect_and_track_persons(self, frames: List[np.ndarray]) -> List[List[Dict]]:
         """
-        Detect and track persons in all frames
+        Detect and track persons in all frames using batch detection (OPTIMIZED)
 
         Returns:
             List of tracked person lists per frame
         """
+        # STEP 1: Batch detect all persons (MUCH FASTER than frame-by-frame)
+        print("  Batch detecting persons...")
+        all_detections = self.person_detector.detect_batch(frames, batch_size=self.batch_size)
+
+        # STEP 2: Track persons frame by frame (requires sequential processing)
+        print("  Tracking persons...")
         all_person_results = []
 
-        for i, frame in enumerate(frames):
-            # Detect persons
-            detections = self.person_detector.detect(frame)
-
+        for i, (frame, detections) in enumerate(zip(frames, all_detections)):
             # Track persons (assign IDs)
             tracked = self.person_tracker.update(frame, detections)
-
             all_person_results.append(tracked)
 
             if (i + 1) % 500 == 0 or i == len(frames) - 1:
-                print(f"  Processed {i + 1}/{len(frames)} frames for persons")
+                print(f"    Tracked {i + 1}/{len(frames)} frames")
 
         return all_person_results
 
@@ -2439,12 +2502,15 @@ class TennisBallTracker:
                     for j, res in enumerate(results):
                         frame_idx = batch_indices[j]
                         if res.boxes is not None and len(res.boxes) > 0:
+                            # Batch transfer all tensors to CPU at once (OPTIMIZED)
+                            boxes_xywh = res.boxes.xywh.cpu().numpy()
+                            boxes_conf = res.boxes.conf.cpu().numpy()
+                            boxes_xyxy = res.boxes.xyxy.cpu().numpy().astype(int)
+
                             for k in range(len(res.boxes)):
-                                x, y, w, h = res.boxes.xywh[k].cpu().numpy()
-                                conf = float(res.boxes.conf[k].cpu().numpy())
-                                x1, y1, x2, y2 = (
-                                    res.boxes.xyxy[k].cpu().numpy().astype(int)
-                                )
+                                x, y, w, h = boxes_xywh[k]
+                                conf = float(boxes_conf[k])
+                                x1, y1, x2, y2 = boxes_xyxy[k]
 
                                 all_detections[frame_idx].append(
                                     {
@@ -2521,10 +2587,15 @@ class TennisBallTracker:
             for res in results:
                 frame_detections = []
                 if res.boxes is not None and len(res.boxes) > 0:
+                    # Batch transfer all tensors to CPU at once (OPTIMIZED)
+                    boxes_xywh = res.boxes.xywh.cpu().numpy()
+                    boxes_conf = res.boxes.conf.cpu().numpy()
+                    boxes_xyxy = res.boxes.xyxy.cpu().numpy().astype(int)
+
                     for j in range(len(res.boxes)):
-                        x, y, w, h = res.boxes.xywh[j].cpu().numpy()
-                        conf_score = float(res.boxes.conf[j].cpu().numpy())
-                        x1, y1, x2, y2 = res.boxes.xyxy[j].cpu().numpy().astype(int)
+                        x, y, w, h = boxes_xywh[j]
+                        conf_score = float(boxes_conf[j])
+                        x1, y1, x2, y2 = boxes_xyxy[j]
 
                         frame_detections.append(
                             {
@@ -2672,10 +2743,15 @@ class TennisBallTracker:
             for res in results:
                 frame_detections = []
                 if res.boxes is not None and len(res.boxes) > 0:
+                    # Batch transfer all tensors to CPU at once (OPTIMIZED)
+                    boxes_xywh = res.boxes.xywh.cpu().numpy()
+                    boxes_conf = res.boxes.conf.cpu().numpy()
+                    boxes_xyxy = res.boxes.xyxy.cpu().numpy().astype(int)
+
                     for j in range(len(res.boxes)):
-                        x, y, w, h = res.boxes.xywh[j].cpu().numpy()
-                        conf = float(res.boxes.conf[j].cpu().numpy())
-                        x1, y1, x2, y2 = res.boxes.xyxy[j].cpu().numpy().astype(int)
+                        x, y, w, h = boxes_xywh[j]
+                        conf = float(boxes_conf[j])
+                        x1, y1, x2, y2 = boxes_xyxy[j]
 
                         frame_detections.append(
                             {
@@ -3392,7 +3468,7 @@ def main():
         person_model_path=PERSON_MODEL_PATH,
         conf_threshold=0.15,  # Lower threshold for better recall
         person_conf_threshold=0.5,  # Person detection threshold
-        batch_size=16,
+        batch_size=32,
         enable_validation=True,
         enable_enhancement=True,  # CLAHE + sharpening for small balls
         enable_kalman=True,  # Kalman filter for trajectory
