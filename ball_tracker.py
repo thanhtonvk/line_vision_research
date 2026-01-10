@@ -25,6 +25,9 @@ from dataclasses import dataclass, field, asdict
 from typing import List, Tuple, Optional, Dict
 from enum import Enum
 
+# Import MatchAnalyzer for combined pipeline
+from match_analyzer import MatchAnalyzer
+
 
 # =============================================================================
 # DATA CLASSES
@@ -3337,18 +3340,23 @@ def main():
     VIDEO_PATH = "1765199807.mp4"
     MODEL_PATH = "models/ball_best.pt"
     PERSON_MODEL_PATH = "yolov8m.pt"  # Will be auto-downloaded if not exists
+    ID_SAN = "court_001"  # Court/field ID
 
-    # Output paths - JSON filename matches video filename
+    # Output paths - output/{id_san}/{video_name}/
     video_basename = os.path.splitext(os.path.basename(VIDEO_PATH))[0]
-    OUTPUT_JSON = f"output/{video_basename}.json"
-    OUTPUT_VIDEO = f"output/{video_basename}_annotated.mp4"
+    output_dir = f"output/{ID_SAN}/{video_basename}"
+    os.makedirs(output_dir, exist_ok=True)
+    OUTPUT_JSON = f"{output_dir}/{video_basename}.json"
+    OUTPUT_VIDEO = f"{output_dir}/{video_basename}_annotated.mp4"
 
     print("=" * 60)
     print("TENNIS BALL & PERSON DETECTION SYSTEM (ENHANCED)")
     print("=" * 60)
     print(f"Input video: {VIDEO_PATH}")
+    print(f"Court ID: {ID_SAN}")
     print(f"Ball model: {MODEL_PATH}")
     print(f"Person model: {PERSON_MODEL_PATH}")
+    print(f"Output directory: {output_dir}")
     print(f"Output JSON: {OUTPUT_JSON}")
     print(f"Output video: {OUTPUT_VIDEO}")
     print()
@@ -3386,8 +3394,16 @@ def main():
         "bottom_right": {"x": 981, "y": 154},
         "bottom_center": {"x": 887, "y": 343},
         "bottom_left": {"x": 715, "y": 643},
-        "center_left": {"x": 294, "y": 406}
+        "center_left": {"x": 294, "y": 406},
+        "net_y": 406  # center_left.y = net line
     }
+
+    # =========================================================================
+    # STEP 1: Ball & Person Tracking
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("STEP 1: BALL & PERSON TRACKING")
+    print("=" * 60)
 
     # Process video
     result = tracker.process_video(
@@ -3397,9 +3413,9 @@ def main():
         court_data=court_data,
     )
 
-    print("\n" + "=" * 60)
-    print("PROCESSING COMPLETE")
-    print("=" * 60)
+    print("\n" + "-" * 60)
+    print("TRACKING COMPLETE")
+    print("-" * 60)
     print(f"JSON output: {result['output_json']}")
     print(f"Video output: {result['output_video']}")
 
@@ -3416,6 +3432,51 @@ def main():
     print(f"  ids_merged: {person_stats['ids_merged']}")
     if person_stats["id_mapping"]:
         print(f"  id_mapping: {person_stats['id_mapping']}")
+
+    # =========================================================================
+    # STEP 2: Match Analysis
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("STEP 2: MATCH ANALYSIS")
+    print("=" * 60)
+
+    # Analysis output directory: analysis/{id_san}/{video_name}/
+    analysis_dir = f"analysis/{ID_SAN}/{video_basename}"
+
+    # Run match analyzer
+    analyzer = MatchAnalyzer(
+        tracking_json_path=OUTPUT_JSON,
+        video_path=VIDEO_PATH,
+        meme_json_path="meme.json",
+        court_data=court_data,
+        output_dir=analysis_dir
+    )
+
+    analysis_result = analyzer.analyze()
+
+    # =========================================================================
+    # FINAL SUMMARY
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("PIPELINE COMPLETE")
+    print("=" * 60)
+    print(f"\nOutput locations:")
+    print(f"  Tracking JSON: {OUTPUT_JSON}")
+    print(f"  Annotated Video: {OUTPUT_VIDEO}")
+    print(f"  Analysis JSON: {analysis_dir}/{video_basename}_analysis.json")
+    print(f"  Player Images: {analysis_dir}/player_images/")
+    print(f"  Heatmaps: {analysis_dir}/heatmaps/")
+    print(f"  Highlights: {analysis_dir}/highlights/")
+
+    print(f"\nPlayers analyzed: {len(analysis_result['players'])}")
+    print(f"Rallies detected: {len(analysis_result['rallies'])}")
+
+    for pid, player in analysis_result['players'].items():
+        print(f"\nPlayer {pid}:")
+        print(f"  Score: {player['score']}")
+        print(f"  In court rate: {player['shots_in_court_rate']:.1%}")
+        print(f"  Max speed: {player['max_ball_speed_ms']:.1f} m/s")
+        print(f"  Highlights: {len(player['highlights'])}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,86 @@
+[
+    {
+        "description": "Được mệnh danh là : Bẻ cong vật lý.",
+        "image_url": "http://linevision.asia/api/meme/1/image",
+        "name": "Bẻ cong vật lý",
+        "name_category": "Cú đánh xoáy nhất"
+    },
+    {
+        "description": "Được mệnh danh là : Khoan giếng tìm dầu",
+        "image_url": "http://linevision.asia/api/meme/2/image",
+        "name": "Tên lửa hành trình",
+        "name_category": "Cú đánh mạnh nhất"
+    },
+    {
+        "description": "Được mệnh danh là: Khoan giếng tìm dầu.",
+        "image_url": "http://linevision.asia/api/meme/3/image",
+        "name": "Khoan giếng tìm dầu",
+        "name_category": "Cú đánh cắm nhất"
+    },
+    {
+        "description": "Được mệnh danh là: Khoan giếng tìm dầu.",
+        "image_url": "http://linevision.asia/api/meme/4/image",
+        "name": "Khoan giếng tìm dầu 2",
+        "name_category": "Cú đánh cắm nhất"
+    },
+    {
+        "description": "Được mệnh danh là : Cú đánh vũ trụ",
+        "image_url": "http://linevision.asia/api/meme/5/image",
+        "name": "Cú đánh vũ trụ",
+        "name_category": "Cú đánh bay lên trời"
+    },
+    {
+        "description": "Được mệnh danh là : Thánh lau sàn",
+        "image_url": "http://linevision.asia/api/meme/6/image",
+        "name": "Thánh lau sàn",
+        "name_category": "Khụy gối sâu nhất"
+    },
+    {
+        "description": "Được mệnh danh là: Máy chém",
+        "image_url": "http://linevision.asia/api/meme/7/image",
+        "name": "Máy chém 1",
+        "name_category": "Mở vai rộng nhất"
+    },
+    {
+        "description": "Được mệnh danh là: Khủng long T Rex",
+        "image_url": "http://linevision.asia/api/meme/8/image",
+        "name": "Khủng long T-Rex",
+        "name_category": "Mở vai hẹp nhất"
+    },
+    {
+        "description": "Được mệnh danh là: Ma tốc độ",
+        "image_url": "http://linevision.asia/api/meme/9/image",
+        "name": "Ma tốc độ",
+        "name_category": "Người di chuyển nhanh nhất"
+    },
+    {
+        "description": "Được mệnh danh là : Thánh lau sàn",
+        "image_url": "http://linevision.asia/api/meme/10/image",
+        "name": "Võ sĩ karate",
+        "name_category": "Khụy gối sâu nhất"
+    },
+    {
+        "description": "Được mệnh danh là: Kẻ thư giãn",
+        "image_url": "http://linevision.asia/api/meme/11/image",
+        "name": "Kẻ thư giãn hay tượng gỗ",
+        "name_category": "Khép háng hẹp nhất"
+    },
+    {
+        "description": "Được mệnh danh là: Kẻ bao sân",
+        "image_url": "http://linevision.asia/api/meme/12/image",
+        "name": "Kẻ bao sân thần sầu",
+        "name_category": "Người di chuyển rộng nhất"
+    },
+    {
+        "description": "Được mệnh danh là: Kẻ hủy diệt trận đấu",
+        "image_url": "http://linevision.asia/api/meme/13/image",
+        "name": "Kẻ hủy diệt trận đấu",
+        "name_category": "Tỉ lệ bóng trong sân cao nhất"
+    },
+    {
+        "description": "Được mệnh danh là: Cây ATM điểm số",
+        "image_url": "http://linevision.asia/api/meme/14/image",
+        "name": "Cây ATM điểm số",
+        "name_category": "Tỉ lệ bóng ngoài sân cao nhất"
+    }
+]
