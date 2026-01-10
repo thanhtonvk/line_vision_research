@@ -801,7 +801,7 @@ def main():
     """Main entry point"""
     # Configuration - Hardcoded paths as requested
     VIDEO_PATH = "1765199807.mp4"
-    MODEL_PATH = "models/ball_best.onnx"
+    MODEL_PATH = "models/ball_best.pt"
 
     # Output paths - JSON filename matches video filename
     video_basename = os.path.splitext(os.path.basename(VIDEO_PATH))[0]
