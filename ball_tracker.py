@@ -20,6 +20,7 @@ import json
 import numpy as np
 import os
 import math
+import time
 from ultralytics import YOLO
 from dataclasses import dataclass, field, asdict
 from typing import List, Tuple, Optional, Dict
@@ -27,6 +28,21 @@ from enum import Enum
 
 # Import MatchAnalyzer for combined pipeline
 from match_analyzer import MatchAnalyzer
+
+
+def format_time(seconds: float) -> str:
+    """Format seconds to human readable string"""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    elif seconds < 3600:
+        minutes = int(seconds // 60)
+        secs = seconds % 60
+        return f"{minutes}m {secs:.1f}s"
+    else:
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = seconds % 60
+        return f"{hours}h {minutes}m {secs:.1f}s"
 
 
 # =============================================================================
@@ -3405,6 +3421,8 @@ def main():
     print("STEP 1: BALL & PERSON TRACKING")
     print("=" * 60)
 
+    step1_start = time.time()
+
     # Process video
     result = tracker.process_video(
         video_path=VIDEO_PATH,
@@ -3413,9 +3431,12 @@ def main():
         court_data=court_data,
     )
 
+    step1_time = time.time() - step1_start
+
     print("\n" + "-" * 60)
     print("TRACKING COMPLETE")
     print("-" * 60)
+    print(f"Time elapsed: {format_time(step1_time)}")
     print(f"JSON output: {result['output_json']}")
     print(f"Video output: {result['output_video']}")
 
@@ -3440,6 +3461,8 @@ def main():
     print("STEP 2: MATCH ANALYSIS")
     print("=" * 60)
 
+    step2_start = time.time()
+
     # Analysis output directory: analysis/{id_san}/{video_name}/
     analysis_dir = f"analysis/{ID_SAN}/{video_basename}"
 
@@ -3454,12 +3477,21 @@ def main():
 
     analysis_result = analyzer.analyze()
 
+    step2_time = time.time() - step2_start
+    total_time = step1_time + step2_time
+
     # =========================================================================
     # FINAL SUMMARY
     # =========================================================================
     print("\n" + "=" * 60)
     print("PIPELINE COMPLETE")
     print("=" * 60)
+
+    print(f"\nTime Summary:")
+    print(f"  Step 1 (Tracking):  {format_time(step1_time)}")
+    print(f"  Step 2 (Analysis):  {format_time(step2_time)}")
+    print(f"  Total:              {format_time(total_time)}")
+
     print(f"\nOutput locations:")
     print(f"  Tracking JSON: {OUTPUT_JSON}")
     print(f"  Annotated Video: {OUTPUT_VIDEO}")
