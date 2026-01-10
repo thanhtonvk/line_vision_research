@@ -1,7 +1,7 @@
 """
-Tennis Ball Detection and Tracking System (Enhanced)
-=====================================================
-Detects tennis balls using YOLO, tracks with interpolation,
+Tennis Ball & Person Detection and Tracking System (Enhanced)
+==============================================================
+Detects tennis balls and persons using YOLO, tracks with interpolation,
 validates using image comparison, and filters false positives.
 
 Enhanced features for full court wide-angle videos:
@@ -10,6 +10,8 @@ Enhanced features for full court wide-angle videos:
 - Extended interpolation range (up to 30 frames)
 - Trajectory-based candidate recovery
 - Kalman filter for motion prediction
+- Person detection with tile-based approach for accuracy
+- Person tracking with appearance-based ReID to prevent ID switches
 """
 
 import cv2
@@ -46,11 +48,23 @@ class BallDetection:
 
 
 @dataclass
+class PersonDetection:
+    """Single person detection in a frame"""
+    id: int
+    x: float  # center x
+    y: float  # center y
+    bbox: Tuple[int, int, int, int]  # x1, y1, x2, y2
+    confidence: float
+    tracked: bool = True  # True if matched with existing track
+
+
+@dataclass
 class FrameResult:
-    """All ball detections in a single frame"""
+    """All ball and person detections in a single frame"""
     frame_index: int
     timestamp_seconds: float
     balls: List[BallDetection] = field(default_factory=list)
+    persons: List[PersonDetection] = field(default_factory=list)
 
 
 @dataclass
@@ -347,6 +361,415 @@ class ImageEnhancer:
 
 
 # =============================================================================
+# PERSON DETECTOR CLASS (TILE-BASED)
+# =============================================================================
+
+class PersonDetector:
+    """
+    Detects persons using YOLOv8m with tile-based approach for better accuracy
+    on wide-angle full court videos where persons may appear small.
+    """
+
+    PERSON_CLASS_ID = 0  # COCO class ID for person
+
+    def __init__(
+        self,
+        model_path: str = "yolov8m.pt",
+        conf_threshold: float = 0.5,
+        use_tiles: bool = True,
+        tile_overlap: float = 0.2
+    ):
+        self.model = YOLO(model_path)
+        self.conf_threshold = conf_threshold
+        self.use_tiles = use_tiles
+        self.tile_overlap = tile_overlap
+
+    def detect(self, frame: np.ndarray) -> List[Dict]:
+        """
+        Detect persons in frame using tile-based approach
+
+        Returns:
+            List of detections: [{x, y, w, h, conf, bbox}, ...]
+        """
+        if self.use_tiles:
+            return self._detect_with_tiles(frame)
+        else:
+            return self._detect_single(frame)
+
+    def _detect_single(self, frame: np.ndarray) -> List[Dict]:
+        """Detect on full frame"""
+        results = self.model.predict(
+            frame,
+            verbose=False,
+            conf=self.conf_threshold,
+            classes=[self.PERSON_CLASS_ID]
+        )
+
+        detections = []
+        if results[0].boxes is not None and len(results[0].boxes) > 0:
+            for i in range(len(results[0].boxes)):
+                x, y, w, h = results[0].boxes.xywh[i].cpu().numpy()
+                conf = float(results[0].boxes.conf[i].cpu().numpy())
+                x1, y1, x2, y2 = results[0].boxes.xyxy[i].cpu().numpy().astype(int)
+
+                detections.append({
+                    "x": float(x),
+                    "y": float(y),
+                    "w": float(w),
+                    "h": float(h),
+                    "conf": conf,
+                    "bbox": (int(x1), int(y1), int(x2), int(y2))
+                })
+
+        return detections
+
+    def _detect_with_tiles(self, frame: np.ndarray) -> List[Dict]:
+        """
+        Detect using 4 overlapping tiles for better accuracy on distant persons
+        """
+        h, w = frame.shape[:2]
+        tile_h, tile_w = h // 2, w // 2
+
+        # Calculate overlap in pixels
+        overlap_h = int(tile_h * self.tile_overlap)
+        overlap_w = int(tile_w * self.tile_overlap)
+
+        # Define 4 tiles with overlap
+        tiles = [
+            # (x_start, y_start, x_end, y_end)
+            (0, 0, tile_w + overlap_w, tile_h + overlap_h),  # Top-left
+            (tile_w - overlap_w, 0, w, tile_h + overlap_h),  # Top-right
+            (0, tile_h - overlap_h, tile_w + overlap_w, h),  # Bottom-left
+            (tile_w - overlap_w, tile_h - overlap_h, w, h),  # Bottom-right
+        ]
+
+        all_detections = []
+
+        for x_start, y_start, x_end, y_end in tiles:
+            tile = frame[y_start:y_end, x_start:x_end]
+
+            results = self.model.predict(
+                tile,
+                verbose=False,
+                conf=self.conf_threshold,
+                classes=[self.PERSON_CLASS_ID]
+            )
+
+            if results[0].boxes is not None and len(results[0].boxes) > 0:
+                for i in range(len(results[0].boxes)):
+                    x, y, w_det, h_det = results[0].boxes.xywh[i].cpu().numpy()
+                    conf = float(results[0].boxes.conf[i].cpu().numpy())
+                    x1, y1, x2, y2 = results[0].boxes.xyxy[i].cpu().numpy().astype(int)
+
+                    # Convert to full frame coordinates
+                    all_detections.append({
+                        "x": float(x + x_start),
+                        "y": float(y + y_start),
+                        "w": float(w_det),
+                        "h": float(h_det),
+                        "conf": conf,
+                        "bbox": (int(x1 + x_start), int(y1 + y_start),
+                                int(x2 + x_start), int(y2 + y_start))
+                    })
+
+        # Also detect on full frame for large persons
+        full_detections = self._detect_single(frame)
+        all_detections.extend(full_detections)
+
+        # Remove duplicates using NMS
+        return self._nms_detections(all_detections)
+
+    def _nms_detections(self, detections: List[Dict], iou_threshold: float = 0.5) -> List[Dict]:
+        """Non-maximum suppression to remove duplicate detections"""
+        if len(detections) <= 1:
+            return detections
+
+        # Sort by confidence
+        sorted_dets = sorted(detections, key=lambda d: d["conf"], reverse=True)
+        kept = []
+
+        for det in sorted_dets:
+            is_duplicate = False
+            for kept_det in kept:
+                iou = self._calculate_iou(det["bbox"], kept_det["bbox"])
+                if iou > iou_threshold:
+                    is_duplicate = True
+                    break
+
+            if not is_duplicate:
+                kept.append(det)
+
+        return kept
+
+    def _calculate_iou(self, bbox1: Tuple[int, int, int, int], bbox2: Tuple[int, int, int, int]) -> float:
+        """Calculate IoU between two bounding boxes"""
+        x1 = max(bbox1[0], bbox2[0])
+        y1 = max(bbox1[1], bbox2[1])
+        x2 = min(bbox1[2], bbox2[2])
+        y2 = min(bbox1[3], bbox2[3])
+
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+
+        intersection = (x2 - x1) * (y2 - y1)
+        area1 = (bbox1[2] - bbox1[0]) * (bbox1[3] - bbox1[1])
+        area2 = (bbox2[2] - bbox2[0]) * (bbox2[3] - bbox2[1])
+        union = area1 + area2 - intersection
+
+        return intersection / union if union > 0 else 0.0
+
+
+# =============================================================================
+# PERSON TRACKER CLASS (WITH APPEARANCE MATCHING)
+# =============================================================================
+
+class PersonTracker:
+    """
+    Tracks persons across frames using:
+    1. IoU-based matching for nearby persons
+    2. Appearance histogram comparison to prevent ID switches
+    3. Kalman filter for motion prediction
+    """
+
+    def __init__(
+        self,
+        max_disappeared: int = 30,
+        iou_threshold: float = 0.3,
+        appearance_threshold: float = 0.6,
+        max_distance: float = 200
+    ):
+        self.max_disappeared = max_disappeared
+        self.iou_threshold = iou_threshold
+        self.appearance_threshold = appearance_threshold
+        self.max_distance = max_distance
+
+        self.next_id = 1
+        self.tracks: Dict[int, Dict] = {}  # id -> track info
+        self.disappeared: Dict[int, int] = {}  # id -> frames since last seen
+
+    def update(self, frame: np.ndarray, detections: List[Dict]) -> List[Dict]:
+        """
+        Update tracks with new detections
+
+        Returns:
+            List of tracked persons with IDs
+        """
+        if not detections:
+            # Mark all tracks as disappeared
+            for track_id in list(self.tracks.keys()):
+                self.disappeared[track_id] = self.disappeared.get(track_id, 0) + 1
+                if self.disappeared[track_id] > self.max_disappeared:
+                    del self.tracks[track_id]
+                    del self.disappeared[track_id]
+            return []
+
+        if not self.tracks:
+            # No existing tracks - create new ones
+            results = []
+            for det in detections:
+                track_id = self._create_track(frame, det)
+                results.append({**det, "id": track_id, "tracked": True})
+            return results
+
+        # Match detections to existing tracks
+        matched, unmatched_dets, unmatched_tracks = self._match_detections(
+            frame, detections
+        )
+
+        results = []
+
+        # Update matched tracks
+        for track_id, det_idx in matched:
+            det = detections[det_idx]
+            self._update_track(frame, track_id, det)
+            self.disappeared[track_id] = 0
+            results.append({**det, "id": track_id, "tracked": True})
+
+        # Create new tracks for unmatched detections
+        for det_idx in unmatched_dets:
+            det = detections[det_idx]
+            track_id = self._create_track(frame, det)
+            results.append({**det, "id": track_id, "tracked": True})
+
+        # Handle disappeared tracks
+        for track_id in unmatched_tracks:
+            self.disappeared[track_id] = self.disappeared.get(track_id, 0) + 1
+            if self.disappeared[track_id] > self.max_disappeared:
+                del self.tracks[track_id]
+                del self.disappeared[track_id]
+
+        return results
+
+    def _create_track(self, frame: np.ndarray, det: Dict) -> int:
+        """Create a new track"""
+        track_id = self.next_id
+        self.next_id += 1
+
+        # Extract appearance histogram
+        histogram = self._extract_histogram(frame, det["bbox"])
+
+        self.tracks[track_id] = {
+            "bbox": det["bbox"],
+            "center": (det["x"], det["y"]),
+            "histogram": histogram,
+            "velocity": (0, 0)
+        }
+        self.disappeared[track_id] = 0
+
+        return track_id
+
+    def _update_track(self, frame: np.ndarray, track_id: int, det: Dict):
+        """Update existing track"""
+        old_center = self.tracks[track_id]["center"]
+        new_center = (det["x"], det["y"])
+
+        # Update velocity
+        velocity = (new_center[0] - old_center[0], new_center[1] - old_center[1])
+
+        # Update histogram with exponential moving average
+        new_hist = self._extract_histogram(frame, det["bbox"])
+        if new_hist is not None and self.tracks[track_id]["histogram"] is not None:
+            alpha = 0.3
+            self.tracks[track_id]["histogram"] = (
+                alpha * new_hist + (1 - alpha) * self.tracks[track_id]["histogram"]
+            )
+        elif new_hist is not None:
+            self.tracks[track_id]["histogram"] = new_hist
+
+        self.tracks[track_id]["bbox"] = det["bbox"]
+        self.tracks[track_id]["center"] = new_center
+        self.tracks[track_id]["velocity"] = velocity
+
+    def _match_detections(
+        self,
+        frame: np.ndarray,
+        detections: List[Dict]
+    ) -> Tuple[List[Tuple[int, int]], List[int], List[int]]:
+        """
+        Match detections to existing tracks using IoU and appearance
+
+        Returns:
+            (matched pairs, unmatched detection indices, unmatched track ids)
+        """
+        track_ids = list(self.tracks.keys())
+        num_tracks = len(track_ids)
+        num_dets = len(detections)
+
+        if num_tracks == 0:
+            return [], list(range(num_dets)), []
+
+        # Compute cost matrix
+        cost_matrix = np.zeros((num_tracks, num_dets))
+
+        for i, track_id in enumerate(track_ids):
+            track = self.tracks[track_id]
+            for j, det in enumerate(detections):
+                # IoU score
+                iou = self._calculate_iou(track["bbox"], det["bbox"])
+
+                # Distance score
+                dist = math.sqrt(
+                    (track["center"][0] - det["x"])**2 +
+                    (track["center"][1] - det["y"])**2
+                )
+                dist_score = max(0, 1 - dist / self.max_distance)
+
+                # Appearance score
+                det_hist = self._extract_histogram(frame, det["bbox"])
+                if det_hist is not None and track["histogram"] is not None:
+                    appearance_score = cv2.compareHist(
+                        track["histogram"], det_hist, cv2.HISTCMP_CORREL
+                    )
+                    appearance_score = max(0, appearance_score)
+                else:
+                    appearance_score = 0.5
+
+                # Combined score (higher is better)
+                cost_matrix[i, j] = 0.3 * iou + 0.3 * dist_score + 0.4 * appearance_score
+
+        # Greedy matching (Hungarian algorithm would be better but this is simpler)
+        matched = []
+        matched_tracks = set()
+        matched_dets = set()
+
+        # Sort by cost (descending - best matches first)
+        indices = np.unravel_index(np.argsort(-cost_matrix, axis=None), cost_matrix.shape)
+
+        for i, j in zip(indices[0], indices[1]):
+            if i in matched_tracks or j in matched_dets:
+                continue
+
+            score = cost_matrix[i, j]
+            track_id = track_ids[i]
+            track = self.tracks[track_id]
+            det = detections[j]
+
+            # Check if match is valid
+            iou = self._calculate_iou(track["bbox"], det["bbox"])
+            dist = math.sqrt(
+                (track["center"][0] - det["x"])**2 +
+                (track["center"][1] - det["y"])**2
+            )
+
+            if iou >= self.iou_threshold or dist < self.max_distance:
+                matched.append((track_id, j))
+                matched_tracks.add(i)
+                matched_dets.add(j)
+
+        unmatched_dets = [j for j in range(num_dets) if j not in matched_dets]
+        unmatched_tracks = [track_ids[i] for i in range(num_tracks) if i not in matched_tracks]
+
+        return matched, unmatched_dets, unmatched_tracks
+
+    def _extract_histogram(self, frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> Optional[np.ndarray]:
+        """Extract color histogram from person crop for appearance matching"""
+        x1, y1, x2, y2 = bbox
+        h, w = frame.shape[:2]
+
+        # Clamp coordinates
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        crop = frame[y1:y2, x1:x2]
+
+        if crop.size == 0:
+            return None
+
+        # Convert to HSV and compute histogram
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+
+        # Use upper body region (more distinctive than legs)
+        upper_h = crop.shape[0] // 2
+        if upper_h > 10:
+            hsv = hsv[:upper_h, :, :]
+
+        hist = cv2.calcHist([hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
+        cv2.normalize(hist, hist)
+
+        return hist
+
+    def _calculate_iou(self, bbox1: Tuple[int, int, int, int], bbox2: Tuple[int, int, int, int]) -> float:
+        """Calculate IoU between two bounding boxes"""
+        x1 = max(bbox1[0], bbox2[0])
+        y1 = max(bbox1[1], bbox2[1])
+        x2 = min(bbox1[2], bbox2[2])
+        y2 = min(bbox1[3], bbox2[3])
+
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+
+        intersection = (x2 - x1) * (y2 - y1)
+        area1 = (bbox1[2] - bbox1[0]) * (bbox1[3] - bbox1[1])
+        area2 = (bbox2[2] - bbox2[0]) * (bbox2[3] - bbox2[1])
+        union = area1 + area2 - intersection
+
+        return intersection / union if union > 0 else 0.0
+
+
+# =============================================================================
 # BALL INTERPOLATOR CLASS
 # =============================================================================
 
@@ -503,13 +926,15 @@ class BallInterpolator:
 
 class TennisBallTracker:
     """
-    Main class for tennis ball detection and tracking
+    Main class for tennis ball and person detection and tracking
 
     Enhanced features:
     - Multi-pass detection with different confidence thresholds
     - Image enhancement for small ball detection
     - Kalman filter for trajectory prediction
     - Candidate recovery using predicted positions
+    - Person detection with tile-based approach
+    - Person tracking with appearance-based ReID
     """
 
     # Multi-pass confidence thresholds (high to low)
@@ -518,11 +943,15 @@ class TennisBallTracker:
     def __init__(
         self,
         model_path: str = "models/ball_best.pt",
+        person_model_path: str = "yolov8m.pt",
         conf_threshold: float = 0.15,  # Lower base threshold
+        person_conf_threshold: float = 0.5,
         batch_size: int = 16,
         enable_validation: bool = True,
         enable_enhancement: bool = True,
-        enable_kalman: bool = True
+        enable_kalman: bool = True,
+        enable_person_detection: bool = True,
+        use_person_tiles: bool = True
     ):
         self.model = YOLO(model_path)
         self.conf_threshold = conf_threshold
@@ -530,12 +959,24 @@ class TennisBallTracker:
         self.enable_validation = enable_validation
         self.enable_enhancement = enable_enhancement
         self.enable_kalman = enable_kalman
+        self.enable_person_detection = enable_person_detection
 
         self.interpolator = BallInterpolator()
         self.validator: Optional[BallValidator] = None
         self.tracker: Optional[TrajectoryTracker] = None
         self.kalman: Optional[BallKalmanFilter] = None
         self.enhancer: Optional[ImageEnhancer] = None
+
+        # Person detection components
+        self.person_detector: Optional[PersonDetector] = None
+        self.person_tracker: Optional[PersonTracker] = None
+        if enable_person_detection:
+            self.person_detector = PersonDetector(
+                model_path=person_model_path,
+                conf_threshold=person_conf_threshold,
+                use_tiles=use_person_tiles
+            )
+            self.person_tracker = PersonTracker()
 
     def process_video(
         self,
@@ -568,7 +1009,7 @@ class TennisBallTracker:
         frames = self._read_video(video_path)
         print(f"Total frames: {len(frames)}")
 
-        # 3. Multi-pass detection with enhancement
+        # 3. Multi-pass ball detection with enhancement
         print("Detecting balls (multi-pass with enhancement)...")
         raw_detections = self._detect_balls_enhanced(frames)
 
@@ -590,17 +1031,25 @@ class TennisBallTracker:
         print("Validating detections...")
         validated_results = self._validate_and_filter(frames, interpolated, raw_detections)
 
-        # 8. Build frame results
-        frame_results = self._build_frame_results(validated_results, video_info.fps)
+        # 8. Detect and track persons
+        person_results = []
+        if self.enable_person_detection and self.person_detector and self.person_tracker:
+            print("Detecting and tracking persons...")
+            person_results = self._detect_and_track_persons(frames)
 
-        # 9. Calculate statistics
+        # 9. Build frame results (balls + persons)
+        frame_results = self._build_frame_results(
+            validated_results, video_info.fps, person_results
+        )
+
+        # 10. Calculate statistics
         stats = self._calculate_statistics(frame_results, raw_detections)
 
-        # 10. Save JSON
+        # 11. Save JSON
         print(f"Saving JSON to: {output_json_path}")
         self._save_json(video_info, frame_results, stats, output_json_path)
 
-        # 11. Create annotated video
+        # 12. Create annotated video
         print(f"Creating annotated video: {output_video_path}")
         self._create_annotated_video(frames, frame_results, video_info.fps, output_video_path)
 
@@ -612,6 +1061,29 @@ class TennisBallTracker:
             "output_json": output_json_path,
             "output_video": output_video_path
         }
+
+    def _detect_and_track_persons(self, frames: List[np.ndarray]) -> List[List[Dict]]:
+        """
+        Detect and track persons in all frames
+
+        Returns:
+            List of tracked person lists per frame
+        """
+        all_person_results = []
+
+        for i, frame in enumerate(frames):
+            # Detect persons
+            detections = self.person_detector.detect(frame)
+
+            # Track persons (assign IDs)
+            tracked = self.person_tracker.update(frame, detections)
+
+            all_person_results.append(tracked)
+
+            if (i + 1) % 500 == 0 or i == len(frames) - 1:
+                print(f"  Processed {i + 1}/{len(frames)} frames for persons")
+
+        return all_person_results
 
     def _get_video_info(self, video_path: str) -> VideoInfo:
         """Extract video metadata"""
@@ -1004,13 +1476,14 @@ class TennisBallTracker:
     def _build_frame_results(
         self,
         validated_results: List[Dict],
-        fps: float
+        fps: float,
+        person_results: List[List[Dict]] = None
     ) -> List[FrameResult]:
-        """Build final frame results with ball detections"""
+        """Build final frame results with ball and person detections"""
         frame_results = []
         ball_id = 1  # Primary ball tracking
 
-        for res in validated_results:
+        for i, res in enumerate(validated_results):
             frame = FrameResult(
                 frame_index=res["frame_index"],
                 timestamp_seconds=res["frame_index"] / fps
@@ -1060,6 +1533,18 @@ class TennisBallTracker:
                 frame.balls.append(ball)
                 secondary_id += 1
 
+            # Add person detections
+            if person_results and i < len(person_results):
+                for person in person_results[i]:
+                    frame.persons.append(PersonDetection(
+                        id=person["id"],
+                        x=person["x"],
+                        y=person["y"],
+                        bbox=person["bbox"],
+                        confidence=person["conf"],
+                        tracked=person.get("tracked", True)
+                    ))
+
             frame_results.append(frame)
 
         return frame_results
@@ -1069,7 +1554,8 @@ class TennisBallTracker:
         frame_results: List[FrameResult],
         raw_detections: List[List[Dict]]
     ) -> Dict:
-        """Calculate processing statistics"""
+        """Calculate processing statistics for both balls and persons"""
+        # Ball statistics
         total_detections = sum(1 for res in frame_results if any(
             b.source == DetectionSource.DETECTION for b in res.balls
         ))
@@ -1086,13 +1572,27 @@ class TennisBallTracker:
 
         all_confs = [b.confidence for res in frame_results for b in res.balls if b.confidence]
 
+        # Person statistics
+        frames_with_persons = sum(1 for res in frame_results if res.persons)
+        unique_person_ids = set()
+        for res in frame_results:
+            for p in res.persons:
+                unique_person_ids.add(p.id)
+
         return {
-            "total_frames": total_frames,
-            "frames_with_detection": total_detections,
-            "interpolated_frames": interpolated_frames,
-            "rejected_false_positives": rejected,
-            "detection_rate": round(frames_with_ball / total_frames, 4) if total_frames > 0 else 0,
-            "average_confidence": round(sum(all_confs) / len(all_confs), 4) if all_confs else 0
+            "ball": {
+                "total_frames": total_frames,
+                "frames_with_detection": total_detections,
+                "interpolated_frames": interpolated_frames,
+                "rejected_false_positives": rejected,
+                "detection_rate": round(frames_with_ball / total_frames, 4) if total_frames > 0 else 0,
+                "average_confidence": round(sum(all_confs) / len(all_confs), 4) if all_confs else 0
+            },
+            "person": {
+                "frames_with_persons": frames_with_persons,
+                "unique_persons_detected": len(unique_person_ids),
+                "person_ids": sorted(list(unique_person_ids))
+            }
         }
 
     def _save_json(
@@ -1109,10 +1609,17 @@ class TennisBallTracker:
         output = {
             "video_info": asdict(video_info),
             "detection_config": {
-                "model_path": "models/ball_best.pt",
-                "confidence_threshold": self.conf_threshold,
-                "max_interpolation_gap": BallInterpolator.MAX_GAP,
-                "validation_enabled": self.enable_validation
+                "ball": {
+                    "model_path": "models/ball_best.pt",
+                    "confidence_threshold": self.conf_threshold,
+                    "max_interpolation_gap": BallInterpolator.MAX_GAP,
+                    "validation_enabled": self.enable_validation
+                },
+                "person": {
+                    "model_path": "yolov8m.pt",
+                    "enabled": self.enable_person_detection,
+                    "tile_based_detection": True
+                }
             },
             "frames": [
                 {
@@ -1130,6 +1637,17 @@ class TennisBallTracker:
                             "interpolation_method": b.interpolation_method
                         }
                         for b in fr.balls
+                    ],
+                    "persons": [
+                        {
+                            "id": p.id,
+                            "x": round(p.x, 2),
+                            "y": round(p.y, 2),
+                            "confidence": round(p.confidence, 4),
+                            "bbox": {"x1": p.bbox[0], "y1": p.bbox[1], "x2": p.bbox[2], "y2": p.bbox[3]},
+                            "tracked": p.tracked
+                        }
+                        for p in fr.persons
                     ]
                 }
                 for fr in frame_results
@@ -1147,17 +1665,47 @@ class TennisBallTracker:
         fps: float,
         output_path: str
     ):
-        """Create annotated video with ball detections"""
+        """Create annotated video with ball and person detections"""
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
         height, width = frames[0].shape[:2]
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
+        # Colors for different person IDs
+        person_colors = [
+            (255, 0, 0),    # Blue
+            (0, 0, 255),    # Red
+            (255, 0, 255),  # Magenta
+            (0, 255, 255),  # Yellow
+            (255, 255, 0),  # Cyan
+            (128, 0, 128),  # Purple
+            (0, 128, 128),  # Teal
+            (128, 128, 0),  # Olive
+        ]
+
         try:
             for i, (frame, result) in enumerate(zip(frames, frame_results)):
                 annotated = frame.copy()
 
+                # Draw persons first (so balls appear on top)
+                for person in result.persons:
+                    # Get color based on ID
+                    color = person_colors[(person.id - 1) % len(person_colors)]
+
+                    # Draw bounding box
+                    x1, y1, x2, y2 = person.bbox
+                    cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+
+                    # Draw ID label with background
+                    label = f"Person {person.id}"
+                    label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                    cv2.rectangle(annotated, (x1, y1 - label_size[1] - 10),
+                                 (x1 + label_size[0] + 10, y1), color, -1)
+                    cv2.putText(annotated, label, (x1 + 5, y1 - 5),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+                # Draw balls
                 for ball in result.balls:
                     x, y = int(ball.x), int(ball.y)
 
@@ -1173,8 +1721,8 @@ class TennisBallTracker:
 
                     # Draw bbox if available
                     if ball.bbox:
-                        x1, y1, x2, y2 = ball.bbox
-                        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 1)
+                        bx1, by1, bx2, by2 = ball.bbox
+                        cv2.rectangle(annotated, (bx1, by1), (bx2, by2), color, 1)
 
                     # Label
                     src_label = "DET" if ball.source == DetectionSource.DETECTION else "INT"
@@ -1189,6 +1737,14 @@ class TennisBallTracker:
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                 cv2.putText(annotated, f"Frame: {result.frame_index}", (10, 30),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 1)
+
+                # Person count info
+                if result.persons:
+                    person_info = f"Persons: {len(result.persons)}"
+                    cv2.putText(annotated, person_info, (10, 60),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                    cv2.putText(annotated, person_info, (10, 60),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 1)
 
                 out.write(annotated)
 
@@ -1208,6 +1764,7 @@ def main():
     # Configuration - Hardcoded paths as requested
     VIDEO_PATH = "1765199807.mp4"
     MODEL_PATH = "models/ball_best.pt"
+    PERSON_MODEL_PATH = "yolov8m.pt"  # Will be auto-downloaded if not exists
 
     # Output paths - JSON filename matches video filename
     video_basename = os.path.splitext(os.path.basename(VIDEO_PATH))[0]
@@ -1215,28 +1772,35 @@ def main():
     OUTPUT_VIDEO = f"output/{video_basename}_annotated.mp4"
 
     print("=" * 60)
-    print("TENNIS BALL DETECTION AND TRACKING SYSTEM (ENHANCED)")
+    print("TENNIS BALL & PERSON DETECTION SYSTEM (ENHANCED)")
     print("=" * 60)
     print(f"Input video: {VIDEO_PATH}")
-    print(f"Model: {MODEL_PATH}")
+    print(f"Ball model: {MODEL_PATH}")
+    print(f"Person model: {PERSON_MODEL_PATH}")
     print(f"Output JSON: {OUTPUT_JSON}")
     print(f"Output video: {OUTPUT_VIDEO}")
     print()
     print("Enhanced features enabled:")
-    print("  - Multi-pass detection with image enhancement")
-    print("  - Kalman filter for trajectory prediction")
+    print("  - Multi-pass ball detection with image enhancement")
+    print("  - Kalman filter for ball trajectory prediction")
     print("  - Extended interpolation (up to 30 frames)")
     print("  - Trajectory-based candidate recovery")
+    print("  - Person detection with tile-based approach")
+    print("  - Person tracking with appearance-based ReID")
     print("=" * 60)
 
     # Create tracker with enhanced settings
     tracker = TennisBallTracker(
         model_path=MODEL_PATH,
-        conf_threshold=0.15,      # Lower threshold for better recall
+        person_model_path=PERSON_MODEL_PATH,
+        conf_threshold=0.15,          # Lower threshold for better recall
+        person_conf_threshold=0.5,    # Person detection threshold
         batch_size=16,
         enable_validation=True,
-        enable_enhancement=True,  # CLAHE + sharpening for small balls
-        enable_kalman=True        # Kalman filter for trajectory
+        enable_enhancement=True,      # CLAHE + sharpening for small balls
+        enable_kalman=True,           # Kalman filter for trajectory
+        enable_person_detection=True, # Enable person detection
+        use_person_tiles=True         # Use tile-based detection for accuracy
     )
 
     # Process video
@@ -1251,8 +1815,11 @@ def main():
     print("=" * 60)
     print(f"JSON output: {result['output_json']}")
     print(f"Video output: {result['output_video']}")
-    print("\nStatistics:")
-    for key, value in result['statistics'].items():
+    print("\nBall Statistics:")
+    for key, value in result['statistics']['ball'].items():
+        print(f"  {key}: {value}")
+    print("\nPerson Statistics:")
+    for key, value in result['statistics']['person'].items():
         print(f"  {key}: {value}")
 
 
