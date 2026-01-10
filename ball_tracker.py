@@ -2390,10 +2390,10 @@ class TennisBallTracker:
         )
 
         # 12. Create annotated video
-        print(f"Creating annotated video: {output_video_path}")
-        self._create_annotated_video(
-            frames, frame_results, video_info.fps, output_video_path, shots
-        )
+        # print(f"Creating annotated video: {output_video_path}")
+        # self._create_annotated_video(
+        #     frames, frame_results, video_info.fps, output_video_path, shots
+        # )
 
         print("Processing complete!")
 
