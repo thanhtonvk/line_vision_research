@@ -78,6 +78,22 @@ class VideoInfo:
     resolution: Dict[str, int]
 
 
+@dataclass
+class ShotEvent:
+    """Information about a single shot/hit event"""
+    frame_index: int
+    timestamp_seconds: float
+    person_id: int
+    ball_position: Tuple[float, float]  # (x, y)
+    person_bbox: Tuple[int, int, int, int]  # x1, y1, x2, y2
+    # Pose angles (degrees)
+    left_shoulder_angle: Optional[float] = None
+    right_shoulder_angle: Optional[float] = None
+    left_knee_angle: Optional[float] = None
+    right_knee_angle: Optional[float] = None
+    keypoints: Optional[Dict] = None
+
+
 # =============================================================================
 # BALL VALIDATOR CLASS
 # =============================================================================
@@ -1389,6 +1405,322 @@ class BallInterpolator:
 
 
 # =============================================================================
+# POSE ANALYZER CLASS
+# =============================================================================
+
+class PoseAnalyzer:
+    """
+    Analyzes player pose using YOLOv8 Pose estimation.
+    Calculates shoulder and knee angles from keypoints.
+    """
+
+    # COCO Keypoint indices
+    KEYPOINTS = {
+        'nose': 0,
+        'left_eye': 1,
+        'right_eye': 2,
+        'left_ear': 3,
+        'right_ear': 4,
+        'left_shoulder': 5,
+        'right_shoulder': 6,
+        'left_elbow': 7,
+        'right_elbow': 8,
+        'left_wrist': 9,
+        'right_wrist': 10,
+        'left_hip': 11,
+        'right_hip': 12,
+        'left_knee': 13,
+        'right_knee': 14,
+        'left_ankle': 15,
+        'right_ankle': 16
+    }
+
+    def __init__(self, model_path: str = "yolov8m-pose.pt"):
+        """Initialize pose analyzer with YOLOv8 pose model"""
+        self.model = YOLO(model_path)
+        print(f"Loaded pose model: {model_path}")
+
+    def analyze(self, person_crop: np.ndarray) -> Dict:
+        """
+        Analyze pose from a cropped person image.
+
+        Args:
+            person_crop: BGR image of cropped person
+
+        Returns:
+            Dict with angle measurements in degrees
+        """
+        if person_crop is None or person_crop.size == 0:
+            return self._empty_angles()
+
+        try:
+            results = self.model(person_crop, verbose=False)
+
+            if not results or len(results) == 0:
+                return self._empty_angles()
+
+            if results[0].keypoints is None or len(results[0].keypoints) == 0:
+                return self._empty_angles()
+
+            keypoints = results[0].keypoints.xy[0].cpu().numpy()
+
+            angles = {
+                'left_shoulder_angle': self._calc_shoulder_angle(keypoints, 'left'),
+                'right_shoulder_angle': self._calc_shoulder_angle(keypoints, 'right'),
+                'left_knee_angle': self._calc_knee_angle(keypoints, 'left'),
+                'right_knee_angle': self._calc_knee_angle(keypoints, 'right')
+            }
+            return angles
+
+        except Exception as e:
+            print(f"Pose analysis error: {e}")
+            return self._empty_angles()
+
+    def _empty_angles(self) -> Dict:
+        """Return empty angles dict"""
+        return {
+            'left_shoulder_angle': None,
+            'right_shoulder_angle': None,
+            'left_knee_angle': None,
+            'right_knee_angle': None
+        }
+
+    def _calc_angle(self, p1: np.ndarray, p2: np.ndarray, p3: np.ndarray) -> float:
+        """
+        Calculate angle at p2 between three points (in degrees).
+
+        Args:
+            p1, p2, p3: Points as numpy arrays [x, y]
+
+        Returns:
+            Angle in degrees
+        """
+        v1 = p1 - p2
+        v2 = p3 - p2
+
+        norm1 = np.linalg.norm(v1)
+        norm2 = np.linalg.norm(v2)
+
+        if norm1 < 1e-6 or norm2 < 1e-6:
+            return None
+
+        cos_angle = np.dot(v1, v2) / (norm1 * norm2)
+        cos_angle = np.clip(cos_angle, -1.0, 1.0)
+
+        return float(np.degrees(np.arccos(cos_angle)))
+
+    def _calc_shoulder_angle(self, keypoints: np.ndarray, side: str) -> Optional[float]:
+        """
+        Calculate shoulder angle: elbow - shoulder - hip
+
+        Args:
+            keypoints: Array of 17 keypoints [x, y]
+            side: 'left' or 'right'
+
+        Returns:
+            Angle in degrees or None if keypoints not detected
+        """
+        if side == 'left':
+            elbow_idx, shoulder_idx, hip_idx = 7, 5, 11
+        else:
+            elbow_idx, shoulder_idx, hip_idx = 8, 6, 12
+
+        elbow = keypoints[elbow_idx]
+        shoulder = keypoints[shoulder_idx]
+        hip = keypoints[hip_idx]
+
+        # Check if keypoints are valid (not zero)
+        if np.allclose(elbow, 0) or np.allclose(shoulder, 0) or np.allclose(hip, 0):
+            return None
+
+        return self._calc_angle(elbow, shoulder, hip)
+
+    def _calc_knee_angle(self, keypoints: np.ndarray, side: str) -> Optional[float]:
+        """
+        Calculate knee angle: hip - knee - ankle
+
+        Args:
+            keypoints: Array of 17 keypoints [x, y]
+            side: 'left' or 'right'
+
+        Returns:
+            Angle in degrees or None if keypoints not detected
+        """
+        if side == 'left':
+            hip_idx, knee_idx, ankle_idx = 11, 13, 15
+        else:
+            hip_idx, knee_idx, ankle_idx = 12, 14, 16
+
+        hip = keypoints[hip_idx]
+        knee = keypoints[knee_idx]
+        ankle = keypoints[ankle_idx]
+
+        # Check if keypoints are valid (not zero)
+        if np.allclose(hip, 0) or np.allclose(knee, 0) or np.allclose(ankle, 0):
+            return None
+
+        return self._calc_angle(hip, knee, ankle)
+
+
+# =============================================================================
+# SHOT DETECTOR CLASS
+# =============================================================================
+
+class ShotDetector:
+    """
+    Detects shot events when ball position is near a person.
+    Analyzes player pose at each shot moment.
+    """
+
+    def __init__(
+        self,
+        pose_analyzer: PoseAnalyzer,
+        proximity_threshold: float = 50.0,
+        min_frames_between_shots: int = 15
+    ):
+        """
+        Initialize shot detector.
+
+        Args:
+            pose_analyzer: PoseAnalyzer instance for pose estimation
+            proximity_threshold: Max distance (pixels) for ball to be considered "touching" person
+            min_frames_between_shots: Cooldown frames between shots for same person
+        """
+        self.pose_analyzer = pose_analyzer
+        self.proximity_threshold = proximity_threshold
+        self.min_frames_between_shots = min_frames_between_shots
+        self.last_shot_frame = {}  # {person_id: frame_index}
+
+    def detect_shots(
+        self,
+        frames: List[np.ndarray],
+        frame_results: List[FrameResult],
+        fps: float
+    ) -> List[ShotEvent]:
+        """
+        Detect all shot events in the video.
+
+        Args:
+            frames: List of video frames (BGR images)
+            frame_results: List of FrameResult with ball and person detections
+            fps: Video frame rate
+
+        Returns:
+            List of ShotEvent objects
+        """
+        shots = []
+
+        for frame_idx, frame_result in enumerate(frame_results):
+            # Skip if no ball or no persons detected
+            if not frame_result.balls or not frame_result.persons:
+                continue
+
+            # Get primary ball (first one, usually highest confidence)
+            ball = frame_result.balls[0]
+            ball_pos = np.array([ball.x, ball.y])
+
+            # Check each person
+            for person in frame_result.persons:
+                # Check if ball is touching/near person
+                if self._is_ball_touching_person(ball_pos, person.bbox):
+                    # Check cooldown (prevent duplicate shots)
+                    if self._can_register_shot(person.id, frame_idx):
+                        # Create shot event with pose analysis
+                        shot = self._create_shot_event(
+                            frame_idx, fps, person, ball, frames[frame_idx]
+                        )
+                        shots.append(shot)
+                        self.last_shot_frame[person.id] = frame_idx
+
+        return shots
+
+    def _is_ball_touching_person(self, ball_pos: np.ndarray, bbox: Tuple[int, int, int, int]) -> bool:
+        """
+        Check if ball position is within or near person bounding box.
+
+        Args:
+            ball_pos: Ball position [x, y]
+            bbox: Person bounding box (x1, y1, x2, y2)
+
+        Returns:
+            True if ball is touching/near person
+        """
+        x1, y1, x2, y2 = bbox
+
+        # Expand bbox by proximity threshold
+        x1_exp = x1 - self.proximity_threshold
+        y1_exp = y1 - self.proximity_threshold
+        x2_exp = x2 + self.proximity_threshold
+        y2_exp = y2 + self.proximity_threshold
+
+        return (x1_exp <= ball_pos[0] <= x2_exp and
+                y1_exp <= ball_pos[1] <= y2_exp)
+
+    def _can_register_shot(self, person_id: int, frame_idx: int) -> bool:
+        """
+        Check if enough frames have passed since last shot for this person.
+
+        Args:
+            person_id: ID of the person
+            frame_idx: Current frame index
+
+        Returns:
+            True if shot can be registered
+        """
+        if person_id not in self.last_shot_frame:
+            return True
+        return frame_idx - self.last_shot_frame[person_id] >= self.min_frames_between_shots
+
+    def _create_shot_event(
+        self,
+        frame_idx: int,
+        fps: float,
+        person: PersonDetection,
+        ball: BallDetection,
+        frame: np.ndarray
+    ) -> ShotEvent:
+        """
+        Create a ShotEvent with pose analysis.
+
+        Args:
+            frame_idx: Frame index
+            fps: Video FPS
+            person: PersonDetection object
+            ball: BallDetection object
+            frame: Video frame (BGR image)
+
+        Returns:
+            ShotEvent with pose angles
+        """
+        x1, y1, x2, y2 = person.bbox
+
+        # Ensure bbox is within frame bounds
+        h, w = frame.shape[:2]
+        x1 = max(0, int(x1))
+        y1 = max(0, int(y1))
+        x2 = min(w, int(x2))
+        y2 = min(h, int(y2))
+
+        # Crop person from frame
+        person_crop = frame[y1:y2, x1:x2]
+
+        # Analyze pose
+        angles = self.pose_analyzer.analyze(person_crop)
+
+        return ShotEvent(
+            frame_index=frame_idx,
+            timestamp_seconds=frame_idx / fps,
+            person_id=person.id,
+            ball_position=(ball.x, ball.y),
+            person_bbox=person.bbox,
+            left_shoulder_angle=angles.get('left_shoulder_angle'),
+            right_shoulder_angle=angles.get('right_shoulder_angle'),
+            left_knee_angle=angles.get('left_knee_angle'),
+            right_knee_angle=angles.get('right_knee_angle')
+        )
+
+
+# =============================================================================
 # MAIN BALL TRACKER CLASS
 # =============================================================================
 
@@ -1525,16 +1857,25 @@ class TennisBallTracker:
             validated_results, video_info.fps, person_results
         )
 
+        # 9.5. Shot Detection & Pose Analysis
+        shots = []
+        if self.enable_person_detection and frame_results:
+            print("Detecting shots and analyzing poses...")
+            pose_analyzer = PoseAnalyzer()
+            shot_detector = ShotDetector(pose_analyzer)
+            shots = shot_detector.detect_shots(frames, frame_results, video_info.fps)
+            print(f"  Detected {len(shots)} shots")
+
         # 10. Calculate statistics
-        stats = self._calculate_statistics(frame_results, raw_detections, id_mapping)
+        stats = self._calculate_statistics(frame_results, raw_detections, id_mapping, shots)
 
         # 11. Save JSON
         print(f"Saving JSON to: {output_json_path}")
-        self._save_json(video_info, frame_results, stats, output_json_path)
+        self._save_json(video_info, frame_results, stats, output_json_path, shots)
 
         # 12. Create annotated video
         print(f"Creating annotated video: {output_video_path}")
-        self._create_annotated_video(frames, frame_results, video_info.fps, output_video_path)
+        self._create_annotated_video(frames, frame_results, video_info.fps, output_video_path, shots)
 
         print("Processing complete!")
 
@@ -2036,9 +2377,10 @@ class TennisBallTracker:
         self,
         frame_results: List[FrameResult],
         raw_detections: List[List[Dict]],
-        id_mapping: Dict[int, int] = None
+        id_mapping: Dict[int, int] = None,
+        shots: List[ShotEvent] = None
     ) -> Dict:
-        """Calculate processing statistics for both balls and persons"""
+        """Calculate processing statistics for balls, persons, and shots"""
         # Ball statistics
         total_detections = sum(1 for res in frame_results if any(
             b.source == DetectionSource.DETECTION for b in res.balls
@@ -2067,6 +2409,14 @@ class TennisBallTracker:
         ids_merged = len(id_mapping) if id_mapping else 0
         original_ids = len(unique_person_ids) + ids_merged
 
+        # Shot statistics
+        shots = shots or []
+        shots_by_person = {}
+        for shot in shots:
+            if shot.person_id not in shots_by_person:
+                shots_by_person[shot.person_id] = 0
+            shots_by_person[shot.person_id] += 1
+
         return {
             "ball": {
                 "total_frames": total_frames,
@@ -2083,6 +2433,10 @@ class TennisBallTracker:
                 "ids_before_merge": original_ids,
                 "ids_merged": ids_merged,
                 "id_mapping": id_mapping if id_mapping else {}
+            },
+            "shots": {
+                "total_shots": len(shots),
+                "shots_by_person": shots_by_person
             }
         }
 
@@ -2091,9 +2445,10 @@ class TennisBallTracker:
         video_info: VideoInfo,
         frame_results: List[FrameResult],
         stats: Dict,
-        output_path: str
+        output_path: str,
+        shots: List[ShotEvent] = None
     ):
-        """Save results to JSON file"""
+        """Save results to JSON file including shot events"""
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
         # Convert to serializable format
@@ -2143,6 +2498,22 @@ class TennisBallTracker:
                 }
                 for fr in frame_results
             ],
+            "shots": [
+                {
+                    "frame_index": s.frame_index,
+                    "timestamp_seconds": round(s.timestamp_seconds, 4),
+                    "person_id": s.person_id,
+                    "ball_position": {"x": round(s.ball_position[0], 2), "y": round(s.ball_position[1], 2)},
+                    "person_bbox": {"x1": s.person_bbox[0], "y1": s.person_bbox[1], "x2": s.person_bbox[2], "y2": s.person_bbox[3]},
+                    "pose_angles": {
+                        "left_shoulder": round(s.left_shoulder_angle, 2) if s.left_shoulder_angle else None,
+                        "right_shoulder": round(s.right_shoulder_angle, 2) if s.right_shoulder_angle else None,
+                        "left_knee": round(s.left_knee_angle, 2) if s.left_knee_angle else None,
+                        "right_knee": round(s.right_knee_angle, 2) if s.right_knee_angle else None
+                    }
+                }
+                for s in (shots or [])
+            ],
             "statistics": stats
         }
 
@@ -2154,13 +2525,25 @@ class TennisBallTracker:
         frames: List[np.ndarray],
         frame_results: List[FrameResult],
         fps: float,
-        output_path: str
+        output_path: str,
+        shots: List[ShotEvent] = None
     ):
-        """Create annotated video with ball and person detections"""
+        """Create annotated video with ball, person detections and shot events"""
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
         height, width = frames[0].shape[:2]
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+        # Build shot lookup by frame index for quick access
+        shots = shots or []
+        shot_by_frame = {}
+        for shot in shots:
+            if shot.frame_index not in shot_by_frame:
+                shot_by_frame[shot.frame_index] = []
+            shot_by_frame[shot.frame_index].append(shot)
+
+        # Track recent shots for display duration (show for N frames after shot)
+        shot_display_duration = int(fps * 1.5)  # 1.5 seconds
         out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
         # Colors for different person IDs
@@ -2236,6 +2619,68 @@ class TennisBallTracker:
                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                     cv2.putText(annotated, person_info, (10, 60),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 1)
+
+                # Draw shot events (check recent shots within display duration)
+                active_shots = []
+                for frame_idx in range(max(0, i - shot_display_duration), i + 1):
+                    if frame_idx in shot_by_frame:
+                        for shot in shot_by_frame[frame_idx]:
+                            active_shots.append((shot, i - frame_idx))
+
+                for shot, frames_ago in active_shots:
+                    # Draw "SHOT!" indicator with flash effect
+                    shot_color = (0, 255, 255)  # Yellow (BGR)
+                    x1, y1, x2, y2 = shot.person_bbox
+
+                    # Draw highlight box around person who made the shot
+                    thickness = 4 if frames_ago < 5 else 2
+                    cv2.rectangle(annotated, (int(x1) - 5, int(y1) - 5),
+                                 (int(x2) + 5, int(y2) + 5), shot_color, thickness)
+
+                    # Draw "SHOT!" text above the person
+                    if frames_ago < shot_display_duration // 2:
+                        shot_label = "SHOT!"
+                        label_size, _ = cv2.getTextSize(shot_label, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 3)
+                        label_x = int((x1 + x2) / 2 - label_size[0] / 2)
+                        label_y = int(y1) - 20
+
+                        # Background for shot label
+                        cv2.rectangle(annotated, (label_x - 5, label_y - label_size[1] - 5),
+                                     (label_x + label_size[0] + 5, label_y + 5), shot_color, -1)
+                        cv2.putText(annotated, shot_label, (label_x, label_y),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 3)
+
+                    # Draw pose angles if available (show for longer)
+                    if frames_ago < shot_display_duration:
+                        angle_y = int(y2) + 25
+                        angle_x = int(x1)
+
+                        # Prepare angle info
+                        angle_lines = []
+                        if shot.left_shoulder_angle is not None:
+                            angle_lines.append(f"L.Shoulder: {shot.left_shoulder_angle:.1f}")
+                        if shot.right_shoulder_angle is not None:
+                            angle_lines.append(f"R.Shoulder: {shot.right_shoulder_angle:.1f}")
+                        if shot.left_knee_angle is not None:
+                            angle_lines.append(f"L.Knee: {shot.left_knee_angle:.1f}")
+                        if shot.right_knee_angle is not None:
+                            angle_lines.append(f"R.Knee: {shot.right_knee_angle:.1f}")
+
+                        # Draw angle info box
+                        if angle_lines:
+                            box_width = 180
+                            box_height = len(angle_lines) * 22 + 10
+                            cv2.rectangle(annotated, (angle_x, angle_y),
+                                         (angle_x + box_width, angle_y + box_height),
+                                         (0, 0, 0), -1)
+                            cv2.rectangle(annotated, (angle_x, angle_y),
+                                         (angle_x + box_width, angle_y + box_height),
+                                         shot_color, 2)
+
+                            for idx, line in enumerate(angle_lines):
+                                cv2.putText(annotated, line,
+                                           (angle_x + 5, angle_y + 20 + idx * 22),
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
                 out.write(annotated)
 
