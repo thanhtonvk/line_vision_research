@@ -616,7 +616,7 @@ class ImageEnhancer:
 
 class PersonDetector:
     """
-    Detects persons using YOLOv8m with tile-based approach for better accuracy
+    Detects persons using yolov8s with tile-based approach for better accuracy
     on wide-angle full court videos where persons may appear small.
     """
 
@@ -624,7 +624,7 @@ class PersonDetector:
 
     def __init__(
         self,
-        model_path: str = "yolov8m.pt",
+        model_path: str = "yolov8s.pt",
         conf_threshold: float = 0.5,
         use_tiles: bool = True,
         tile_overlap: float = 0.2,
@@ -1696,7 +1696,7 @@ class PoseAnalyzer:
         "right_ankle": 16,
     }
 
-    def __init__(self, model_path: str = "yolov8m-pose.pt"):
+    def __init__(self, model_path: str = "yolov8s-pose.pt"):
         """Initialize pose analyzer with YOLOv8 pose model"""
         self.model = YOLO(model_path)
         print(f"Loaded pose model: {model_path}")
@@ -2168,7 +2168,7 @@ class TennisBallTracker:
     def __init__(
         self,
         model_path: str = "models/ball_best.pt",
-        person_model_path: str = "yolov8m.pt",
+        person_model_path: str = "yolov8s.pt",
         conf_threshold: float = 0.15,  # Lower base threshold
         person_conf_threshold: float = 0.5,
         batch_size: int = 16,
@@ -2948,7 +2948,7 @@ class TennisBallTracker:
                     "validation_enabled": self.enable_validation,
                 },
                 "person": {
-                    "model_path": "yolov8m.pt",
+                    "model_path": "yolov8s.pt",
                     "enabled": self.enable_person_detection,
                     "tile_based_detection": True,
                 },
@@ -3339,7 +3339,7 @@ def main():
     # Configuration - Hardcoded paths as requested
     VIDEO_PATH = "1765199807.mp4"
     MODEL_PATH = "models/ball_best.pt"
-    PERSON_MODEL_PATH = "yolov8m.pt"  # Will be auto-downloaded if not exists
+    PERSON_MODEL_PATH = "yolov8s.pt"  # Will be auto-downloaded if not exists
     ID_SAN = "court_001"  # Court/field ID
 
     # Output paths - output/{id_san}/{video_name}/
