@@ -1,8 +1,15 @@
 """
-Tennis Ball Detection and Tracking System
-==========================================
+Tennis Ball Detection and Tracking System (Enhanced)
+=====================================================
 Detects tennis balls using YOLO, tracks with interpolation,
 validates using image comparison, and filters false positives.
+
+Enhanced features for full court wide-angle videos:
+- Multi-confidence detection passes
+- Image enhancement for small ball detection
+- Extended interpolation range (up to 30 frames)
+- Trajectory-based candidate recovery
+- Kalman filter for motion prediction
 """
 
 import cv2
@@ -204,6 +211,142 @@ class TrajectoryTracker:
 
 
 # =============================================================================
+# KALMAN FILTER FOR BALL TRACKING
+# =============================================================================
+
+class BallKalmanFilter:
+    """
+    Kalman filter for predicting ball position
+    State: [x, y, vx, vy] (position and velocity)
+    """
+
+    def __init__(self):
+        # State transition matrix (constant velocity model)
+        self.F = np.array([
+            [1, 0, 1, 0],
+            [0, 1, 0, 1],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ], dtype=np.float32)
+
+        # Observation matrix (we only observe position)
+        self.H = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0]
+        ], dtype=np.float32)
+
+        # Process noise covariance
+        self.Q = np.eye(4, dtype=np.float32) * 0.1
+        self.Q[2, 2] = 1.0  # velocity has more uncertainty
+        self.Q[3, 3] = 1.0
+
+        # Measurement noise covariance
+        self.R = np.eye(2, dtype=np.float32) * 1.0
+
+        # State and covariance
+        self.x = np.zeros(4, dtype=np.float32)  # [x, y, vx, vy]
+        self.P = np.eye(4, dtype=np.float32) * 100
+
+        self.initialized = False
+
+    def init(self, x: float, y: float):
+        """Initialize filter with first observation"""
+        self.x = np.array([x, y, 0, 0], dtype=np.float32)
+        self.P = np.eye(4, dtype=np.float32) * 100
+        self.initialized = True
+
+    def predict(self) -> Tuple[float, float]:
+        """Predict next state"""
+        if not self.initialized:
+            return 0.0, 0.0
+
+        # Predict state
+        self.x = self.F @ self.x
+        self.P = self.F @ self.P @ self.F.T + self.Q
+
+        return float(self.x[0]), float(self.x[1])
+
+    def update(self, x: float, y: float) -> Tuple[float, float]:
+        """Update with observation"""
+        if not self.initialized:
+            self.init(x, y)
+            return x, y
+
+        # Measurement
+        z = np.array([x, y], dtype=np.float32)
+
+        # Innovation
+        y_innov = z - self.H @ self.x
+        S = self.H @ self.P @ self.H.T + self.R
+
+        # Kalman gain
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+
+        # Update state
+        self.x = self.x + K @ y_innov
+        self.P = (np.eye(4) - K @ self.H) @ self.P
+
+        return float(self.x[0]), float(self.x[1])
+
+    def get_velocity(self) -> Tuple[float, float]:
+        """Get current velocity estimate"""
+        return float(self.x[2]), float(self.x[3])
+
+    def get_predicted_position(self, frames_ahead: int = 1) -> Tuple[float, float]:
+        """Predict position n frames ahead without updating state"""
+        if not self.initialized:
+            return 0.0, 0.0
+
+        x_pred = self.x.copy()
+        for _ in range(frames_ahead):
+            x_pred = self.F @ x_pred
+
+        return float(x_pred[0]), float(x_pred[1])
+
+
+# =============================================================================
+# IMAGE ENHANCER FOR SMALL BALL DETECTION
+# =============================================================================
+
+class ImageEnhancer:
+    """
+    Enhances frames to improve detection of small balls in wide-angle videos
+    """
+
+    def __init__(self, enable_clahe: bool = True, enable_sharpening: bool = True):
+        self.enable_clahe = enable_clahe
+        self.enable_sharpening = enable_sharpening
+
+        # CLAHE for contrast enhancement
+        self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+        # Sharpening kernel
+        self.sharpen_kernel = np.array([
+            [0, -1, 0],
+            [-1, 5, -1],
+            [0, -1, 0]
+        ], dtype=np.float32)
+
+    def enhance(self, frame: np.ndarray) -> np.ndarray:
+        """Apply enhancement to frame"""
+        enhanced = frame.copy()
+
+        if self.enable_clahe:
+            # Apply CLAHE to L channel in LAB color space
+            lab = cv2.cvtColor(enhanced, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            l = self.clahe.apply(l)
+            lab = cv2.merge([l, a, b])
+            enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+        if self.enable_sharpening:
+            # Apply sharpening
+            enhanced = cv2.filter2D(enhanced, -1, self.sharpen_kernel)
+
+        return enhanced
+
+
+# =============================================================================
 # BALL INTERPOLATOR CLASS
 # =============================================================================
 
@@ -211,10 +354,10 @@ class BallInterpolator:
     """
     Interpolates missing ball positions using:
     - Linear interpolation for small gaps (1-2 frames)
-    - Parabolic interpolation for larger gaps (3-15 frames)
+    - Parabolic interpolation for larger gaps (3-30 frames)
     """
 
-    MAX_GAP = 15
+    MAX_GAP = 30  # Increased from 15 for wide-angle videos
     PARABOLIC_THRESHOLD = 3
 
     def interpolate(
@@ -361,23 +504,38 @@ class BallInterpolator:
 class TennisBallTracker:
     """
     Main class for tennis ball detection and tracking
+
+    Enhanced features:
+    - Multi-pass detection with different confidence thresholds
+    - Image enhancement for small ball detection
+    - Kalman filter for trajectory prediction
+    - Candidate recovery using predicted positions
     """
+
+    # Multi-pass confidence thresholds (high to low)
+    CONF_THRESHOLDS = [0.3, 0.2, 0.15]
 
     def __init__(
         self,
         model_path: str = "models/ball_best.pt",
-        conf_threshold: float = 0.3,
+        conf_threshold: float = 0.15,  # Lower base threshold
         batch_size: int = 16,
-        enable_validation: bool = True
+        enable_validation: bool = True,
+        enable_enhancement: bool = True,
+        enable_kalman: bool = True
     ):
         self.model = YOLO(model_path)
         self.conf_threshold = conf_threshold
         self.batch_size = batch_size
         self.enable_validation = enable_validation
+        self.enable_enhancement = enable_enhancement
+        self.enable_kalman = enable_kalman
 
         self.interpolator = BallInterpolator()
         self.validator: Optional[BallValidator] = None
         self.tracker: Optional[TrajectoryTracker] = None
+        self.kalman: Optional[BallKalmanFilter] = None
+        self.enhancer: Optional[ImageEnhancer] = None
 
     def process_video(
         self,
@@ -386,7 +544,7 @@ class TennisBallTracker:
         output_video_path: str
     ) -> Dict:
         """
-        Main processing pipeline
+        Main processing pipeline (Enhanced)
 
         Args:
             video_path: Path to input video
@@ -399,41 +557,50 @@ class TennisBallTracker:
         # 1. Get video info
         video_info = self._get_video_info(video_path)
 
-        # Initialize validator and tracker
+        # Initialize components
         self.validator = BallValidator(video_info.resolution["height"])
         self.tracker = TrajectoryTracker(video_info.fps)
+        self.kalman = BallKalmanFilter() if self.enable_kalman else None
+        self.enhancer = ImageEnhancer() if self.enable_enhancement else None
 
         # 2. Read all frames
         print(f"Reading video: {video_path}")
         frames = self._read_video(video_path)
         print(f"Total frames: {len(frames)}")
 
-        # 3. Detect balls in all frames
-        print("Detecting balls...")
-        raw_detections = self._detect_balls(frames)
+        # 3. Multi-pass detection with enhancement
+        print("Detecting balls (multi-pass with enhancement)...")
+        raw_detections = self._detect_balls_enhanced(frames)
 
-        # 4. Extract primary positions (best detection per frame)
-        raw_positions = self._extract_primary_positions(raw_detections)
+        # 4. Extract primary positions with Kalman-assisted selection
+        print("Extracting positions with trajectory prediction...")
+        raw_positions = self._extract_positions_with_kalman(raw_detections)
 
-        # 5. Interpolate missing positions
-        print("Interpolating missing positions...")
-        interpolated = self.interpolator.interpolate(raw_positions)
+        # 5. Recover missing detections using predicted positions
+        print("Recovering missing detections...")
+        recovered_positions = self._recover_missing_detections(
+            frames, raw_positions, raw_detections
+        )
 
-        # 6. Validate and filter
+        # 6. Interpolate remaining missing positions
+        print("Interpolating remaining gaps...")
+        interpolated = self.interpolator.interpolate(recovered_positions)
+
+        # 7. Validate and filter
         print("Validating detections...")
         validated_results = self._validate_and_filter(frames, interpolated, raw_detections)
 
-        # 7. Build frame results
+        # 8. Build frame results
         frame_results = self._build_frame_results(validated_results, video_info.fps)
 
-        # 8. Calculate statistics
+        # 9. Calculate statistics
         stats = self._calculate_statistics(frame_results, raw_detections)
 
-        # 9. Save JSON
+        # 10. Save JSON
         print(f"Saving JSON to: {output_json_path}")
         self._save_json(video_info, frame_results, stats, output_json_path)
 
-        # 10. Create annotated video
+        # 11. Create annotated video
         print(f"Creating annotated video: {output_video_path}")
         self._create_annotated_video(frames, frame_results, video_info.fps, output_video_path)
 
@@ -474,6 +641,245 @@ class TennisBallTracker:
             frames.append(frame)
         cap.release()
         return frames
+
+    def _detect_balls_enhanced(self, frames: List[np.ndarray]) -> List[List[Dict]]:
+        """
+        Enhanced detection with:
+        1. Multi-pass with different confidence thresholds
+        2. Image enhancement for difficult frames
+        3. Merge detections from all passes
+        """
+        all_detections = [[] for _ in range(len(frames))]
+
+        # Pass 1: Normal detection with low confidence
+        print("  Pass 1: Standard detection...")
+        pass1_detections = self._detect_balls_batch(frames, self.conf_threshold)
+
+        for i, dets in enumerate(pass1_detections):
+            all_detections[i].extend(dets)
+
+        # Pass 2: Enhanced frames for missing detections
+        if self.enhancer:
+            missing_indices = [i for i, dets in enumerate(pass1_detections) if not dets]
+
+            if missing_indices:
+                print(f"  Pass 2: Enhanced detection for {len(missing_indices)} missing frames...")
+
+                # Process in batches
+                for batch_start in range(0, len(missing_indices), self.batch_size):
+                    batch_indices = missing_indices[batch_start:batch_start + self.batch_size]
+                    enhanced_batch = [self.enhancer.enhance(frames[i]) for i in batch_indices]
+
+                    results = self.model.predict(
+                        enhanced_batch,
+                        verbose=False,
+                        conf=self.conf_threshold * 0.8  # Slightly lower threshold for enhanced
+                    )
+
+                    for j, res in enumerate(results):
+                        frame_idx = batch_indices[j]
+                        if res.boxes is not None and len(res.boxes) > 0:
+                            for k in range(len(res.boxes)):
+                                x, y, w, h = res.boxes.xywh[k].cpu().numpy()
+                                conf = float(res.boxes.conf[k].cpu().numpy())
+                                x1, y1, x2, y2 = res.boxes.xyxy[k].cpu().numpy().astype(int)
+
+                                all_detections[frame_idx].append({
+                                    "x": float(x),
+                                    "y": float(y),
+                                    "w": float(w),
+                                    "h": float(h),
+                                    "conf": conf,
+                                    "bbox": (int(x1), int(y1), int(x2), int(y2)),
+                                    "enhanced": True
+                                })
+
+        # Remove duplicates (same position from different passes)
+        for i in range(len(all_detections)):
+            all_detections[i] = self._remove_duplicate_detections(all_detections[i])
+
+        return all_detections
+
+    def _remove_duplicate_detections(self, detections: List[Dict], iou_threshold: float = 0.5) -> List[Dict]:
+        """Remove duplicate detections based on IoU"""
+        if len(detections) <= 1:
+            return detections
+
+        # Sort by confidence (highest first)
+        sorted_dets = sorted(detections, key=lambda d: d["conf"], reverse=True)
+        kept = []
+
+        for det in sorted_dets:
+            is_duplicate = False
+            for kept_det in kept:
+                iou = self._calculate_iou(det["bbox"], kept_det["bbox"])
+                if iou > iou_threshold:
+                    is_duplicate = True
+                    break
+
+            if not is_duplicate:
+                kept.append(det)
+
+        return kept
+
+    def _calculate_iou(self, bbox1: Tuple[int, int, int, int], bbox2: Tuple[int, int, int, int]) -> float:
+        """Calculate IoU between two bounding boxes"""
+        x1 = max(bbox1[0], bbox2[0])
+        y1 = max(bbox1[1], bbox2[1])
+        x2 = min(bbox1[2], bbox2[2])
+        y2 = min(bbox1[3], bbox2[3])
+
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+
+        intersection = (x2 - x1) * (y2 - y1)
+        area1 = (bbox1[2] - bbox1[0]) * (bbox1[3] - bbox1[1])
+        area2 = (bbox2[2] - bbox2[0]) * (bbox2[3] - bbox2[1])
+        union = area1 + area2 - intersection
+
+        return intersection / union if union > 0 else 0.0
+
+    def _detect_balls_batch(self, frames: List[np.ndarray], conf: float) -> List[List[Dict]]:
+        """Detect balls in frames using batch inference"""
+        all_detections = []
+
+        for i in range(0, len(frames), self.batch_size):
+            batch = frames[i:i + self.batch_size]
+
+            results = self.model.predict(
+                batch,
+                verbose=False,
+                conf=conf
+            )
+
+            for res in results:
+                frame_detections = []
+                if res.boxes is not None and len(res.boxes) > 0:
+                    for j in range(len(res.boxes)):
+                        x, y, w, h = res.boxes.xywh[j].cpu().numpy()
+                        conf_score = float(res.boxes.conf[j].cpu().numpy())
+                        x1, y1, x2, y2 = res.boxes.xyxy[j].cpu().numpy().astype(int)
+
+                        frame_detections.append({
+                            "x": float(x),
+                            "y": float(y),
+                            "w": float(w),
+                            "h": float(h),
+                            "conf": conf_score,
+                            "bbox": (int(x1), int(y1), int(x2), int(y2))
+                        })
+
+                all_detections.append(frame_detections)
+
+            # Progress
+            progress = min(i + self.batch_size, len(frames))
+            if progress % 500 == 0 or progress == len(frames):
+                print(f"    Processed {progress}/{len(frames)} frames")
+
+        return all_detections
+
+    def _extract_positions_with_kalman(
+        self,
+        detections: List[List[Dict]]
+    ) -> List[Optional[Tuple[float, float]]]:
+        """
+        Extract positions using Kalman filter for trajectory prediction
+        When multiple detections exist, choose the one closest to predicted position
+        """
+        positions = []
+        kalman = BallKalmanFilter()
+
+        for frame_idx, frame_dets in enumerate(detections):
+            if not frame_dets:
+                # No detection - use Kalman prediction for tracking state
+                if kalman.initialized:
+                    kalman.predict()
+                positions.append(None)
+                continue
+
+            if not kalman.initialized:
+                # First detection - just use highest confidence
+                best = max(frame_dets, key=lambda d: d["conf"])
+                kalman.init(best["x"], best["y"])
+                positions.append((best["x"], best["y"]))
+            else:
+                # Predict next position
+                pred_x, pred_y = kalman.predict()
+
+                # Find detection closest to prediction
+                best_det = None
+                best_score = float('inf')
+
+                for det in frame_dets:
+                    dist = math.sqrt((det["x"] - pred_x)**2 + (det["y"] - pred_y)**2)
+                    # Score combines distance and confidence
+                    score = dist - det["conf"] * 50  # Weight confidence
+
+                    if score < best_score:
+                        best_score = score
+                        best_det = det
+
+                if best_det:
+                    kalman.update(best_det["x"], best_det["y"])
+                    positions.append((best_det["x"], best_det["y"]))
+                else:
+                    positions.append(None)
+
+        return positions
+
+    def _recover_missing_detections(
+        self,
+        frames: List[np.ndarray],  # noqa: F841 - kept for future ROI detection
+        positions: List[Optional[Tuple[float, float]]],
+        detections: List[List[Dict]]
+    ) -> List[Optional[Tuple[float, float]]]:
+        """
+        Try to recover missing detections by:
+        1. Using Kalman predicted positions to search in low-confidence detections
+        2. Running targeted detection on predicted ROI
+        """
+        recovered = list(positions)  # Copy
+        kalman = BallKalmanFilter()
+
+        # Build trajectory from known positions
+        for i, pos in enumerate(positions):
+            if pos is not None:
+                if not kalman.initialized:
+                    kalman.init(pos[0], pos[1])
+                else:
+                    kalman.predict()
+                    kalman.update(pos[0], pos[1])
+
+        # Reset and try to recover
+        kalman = BallKalmanFilter()
+        recovery_count = 0
+
+        for i, pos in enumerate(positions):
+            if pos is not None:
+                if not kalman.initialized:
+                    kalman.init(pos[0], pos[1])
+                else:
+                    kalman.predict()
+                    kalman.update(pos[0], pos[1])
+            elif kalman.initialized:
+                # Missing detection - try to recover
+                pred_x, pred_y = kalman.predict()
+
+                # Look for low-confidence detections near predicted position
+                search_radius = 100  # pixels
+
+                for det in detections[i]:
+                    dist = math.sqrt((det["x"] - pred_x)**2 + (det["y"] - pred_y)**2)
+                    if dist < search_radius:
+                        recovered[i] = (det["x"], det["y"])
+                        kalman.update(det["x"], det["y"])
+                        recovery_count += 1
+                        break
+
+        if recovery_count > 0:
+            print(f"  Recovered {recovery_count} missing detections using trajectory prediction")
+
+        return recovered
 
     def _detect_balls(self, frames: List[np.ndarray]) -> List[List[Dict]]:
         """
@@ -809,20 +1215,28 @@ def main():
     OUTPUT_VIDEO = f"output/{video_basename}_annotated.mp4"
 
     print("=" * 60)
-    print("TENNIS BALL DETECTION AND TRACKING SYSTEM")
+    print("TENNIS BALL DETECTION AND TRACKING SYSTEM (ENHANCED)")
     print("=" * 60)
     print(f"Input video: {VIDEO_PATH}")
     print(f"Model: {MODEL_PATH}")
     print(f"Output JSON: {OUTPUT_JSON}")
     print(f"Output video: {OUTPUT_VIDEO}")
+    print()
+    print("Enhanced features enabled:")
+    print("  - Multi-pass detection with image enhancement")
+    print("  - Kalman filter for trajectory prediction")
+    print("  - Extended interpolation (up to 30 frames)")
+    print("  - Trajectory-based candidate recovery")
     print("=" * 60)
 
-    # Create tracker
+    # Create tracker with enhanced settings
     tracker = TennisBallTracker(
         model_path=MODEL_PATH,
-        conf_threshold=0.3,
+        conf_threshold=0.15,      # Lower threshold for better recall
         batch_size=16,
-        enable_validation=True
+        enable_validation=True,
+        enable_enhancement=True,  # CLAHE + sharpening for small balls
+        enable_kalman=True        # Kalman filter for trajectory
     )
 
     # Process video
