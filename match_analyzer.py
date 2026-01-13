@@ -399,11 +399,15 @@ class HighlightGenerator:
                  video_path: str,
                  output_dir: str,
                  meme_data: List[Dict],
-                 padding_seconds: float = 3.0):
+                 padding_seconds: float = 3.0,
+                 use_ffmpeg: bool = True,  # Dùng FFmpeg để nén tốt hơn
+                 crf: int = 28):  # Chất lượng nén (18-28, cao hơn = file nhỏ hơn)
         self.video_path = video_path
         self.output_dir = output_dir
         self.meme_data = meme_data
         self.padding_seconds = padding_seconds
+        self.use_ffmpeg = use_ffmpeg
+        self.crf = crf  # Constant Rate Factor: 18=high quality, 28=smaller file
 
         os.makedirs(output_dir, exist_ok=True)
 
@@ -477,7 +481,33 @@ class HighlightGenerator:
     def _cut_video_segment(self, cap: cv2.VideoCapture, output_path: str,
                            start_time: float, end_time: float,
                            fps: float, width: int, height: int):
-        """Cắt một đoạn video"""
+        """Cắt một đoạn video với nén tối ưu bằng FFmpeg"""
+        import subprocess
+        import shutil
+
+        if self.use_ffmpeg and shutil.which('ffmpeg'):
+            # Dùng FFmpeg để nén với H.264 - giữ nguyên resolution
+            duration = end_time - start_time
+            cmd = [
+                'ffmpeg', '-y',
+                '-ss', str(start_time),
+                '-i', self.video_path,
+                '-t', str(duration),
+                '-c:v', 'libx264',
+                '-crf', str(self.crf),  # Chất lượng nén (18-28)
+                '-preset', 'fast',  # Tốc độ encode (fast = cân bằng)
+                '-c:a', 'aac',
+                '-b:a', '128k',
+                '-movflags', '+faststart',  # Cho phép stream
+                output_path
+            ]
+            try:
+                subprocess.run(cmd, capture_output=True, check=True)
+                return
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                pass  # Fallback to OpenCV
+
+        # Fallback: OpenCV với codec tốt nhất có thể
         start_frame = int(start_time * fps)
         end_frame = int(end_time * fps)
 
