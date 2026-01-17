@@ -2111,7 +2111,7 @@ if __name__ == "__main__":
         "bottom_center": {"x": 887, "y": 343},
         "bottom_left": {"x": 715, "y": 643},
         "center_left": {"x": 294, "y": 406},
-        "net_y": 406  # center_left.y = net line
+        "net_y": 406 
     }
 
     print(f"Court ID: {ID_SAN}")
