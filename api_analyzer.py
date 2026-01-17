@@ -135,18 +135,18 @@ def run_tracking(video_path: str, id_san: str, court_data: Dict) -> str:
     output_dir = f"output/{id_san}/{video_basename}"
     os.makedirs(output_dir, exist_ok=True)
 
-    tracker = TennisBallTracker(
+    # Output paths
+    tracking_json_path = os.path.join(output_dir, f"{video_basename}.json")
+    output_video_path = os.path.join(output_dir, f"{video_basename}_tracked.mp4")
+
+    # Create tracker and process video
+    tracker = TennisBallTracker()
+    tracker.process_video(
         video_path=video_path,
-        output_dir=output_dir,
+        output_json_path=tracking_json_path,
+        output_video_path=output_video_path,
         court_data=court_data
     )
-
-    tracking_result = tracker.process()
-
-    # Save tracking JSON
-    tracking_json_path = os.path.join(output_dir, f"{video_basename}.json")
-    with open(tracking_json_path, 'w', encoding='utf-8') as f:
-        json.dump(tracking_result, f, ensure_ascii=False, indent=2)
 
     return tracking_json_path
 
