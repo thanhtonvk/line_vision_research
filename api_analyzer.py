@@ -126,11 +126,46 @@ def send_callback(file_name: str, court_id: str, result: Dict) -> bool:
         return False
 
 
+def validate_video(video_path: str) -> bool:
+    """
+    Kiểm tra video có hợp lệ không.
+    Returns: True nếu video hợp lệ
+    """
+    import cv2
+
+    if not os.path.exists(video_path):
+        print(f"[API] Video file not found: {video_path}")
+        return False
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"[API] Cannot open video: {video_path}")
+        return False
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+
+    if fps <= 0 or frame_count <= 0 or width <= 0 or height <= 0:
+        print(f"[API] Invalid video metadata: fps={fps}, frames={frame_count}, size={width}x{height}")
+        return False
+
+    print(f"[API] Video validated: {fps}fps, {frame_count} frames, {width}x{height}")
+    return True
+
+
 def run_tracking(video_path: str, id_san: str, court_data: Dict) -> str:
     """
     Chạy ball tracking trên video.
     Returns: Path to tracking JSON
+    Raises: ValueError nếu video không hợp lệ
     """
+    # Validate video first
+    if not validate_video(video_path):
+        raise ValueError(f"Invalid video file: {video_path}")
+
     video_basename = os.path.splitext(os.path.basename(video_path))[0]
     output_dir = f"output/{id_san}/{video_basename}"
     os.makedirs(output_dir, exist_ok=True)
