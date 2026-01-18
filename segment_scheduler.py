@@ -270,7 +270,7 @@ def process_hour_segment(id_san: str, date: datetime, start_hour: int) -> Option
 
             # Add metadata
             result["request_id"] = request_id
-            result["file_name"] = original_filename
+            result["file_name"] = f"{avg_ts}.json"
             result["court_id"] = id_san
             result["timestamp"] = datetime.now().isoformat()
             result["expires_at"] = (datetime.now() + timedelta(hours=CLEANUP_HOURS)).isoformat()
@@ -341,7 +341,7 @@ def process_all_courts_for_hour(start_hour: int, date: datetime = None, court_id
         results[id_san] = result
 
     # Summary
-    success_count = sum(1 for r in results.values() if r is not None)
+    success_count = sum(r is not None for r in results.values())
     log(f"\nSummary: {success_count}/{len(court_ids)} courts processed successfully")
     log("=" * 60 + "\n")
 
