@@ -2287,10 +2287,10 @@ class TennisBallTracker:
 
     def process_video(
         self, video_path: str, output_json_path: str, output_video_path: str,
-        court_data: Dict = None
+        court_data: Dict = None, chunk_size: int = 500
     ) -> Dict:
         """
-        Main processing pipeline (Enhanced)
+        Main processing pipeline (Enhanced) - Memory efficient with chunk processing
 
         Args:
             video_path: Path to input video
@@ -2298,12 +2298,14 @@ class TennisBallTracker:
             output_video_path: Path to save annotated video
             court_data: Optional dict with court coordinates for alignment.
                         If None, court alignment is disabled.
+            chunk_size: Number of frames to process at a time (default 500)
 
         Returns:
             Processing results dictionary
         """
         # 1. Get video info
         video_info = self._get_video_info(video_path)
+        total_frames = video_info.total_frames
 
         # Initialize components
         self.validator = BallValidator(video_info.resolution["height"])
@@ -2311,71 +2313,89 @@ class TennisBallTracker:
         self.kalman = BallKalmanFilter() if self.enable_kalman else None
         self.enhancer = ImageEnhancer() if self.enable_enhancement else None
 
-        # 2. Read all frames
-        print(f"Reading video: {video_path}")
-        frames = self._read_video(video_path)
-        print(f"Total frames: {len(frames)}")
+        print(f"Processing video: {video_path}")
+        print(f"Total frames: {total_frames}, Chunk size: {chunk_size}")
 
-        # 3. Multi-pass ball detection with enhancement
-        print("Detecting balls (multi-pass with enhancement)...")
-        raw_detections = self._detect_balls_enhanced(frames)
+        # 2. Process video in chunks to save memory
+        all_raw_detections = []
+        all_person_detections = []
 
-        # 4. Extract primary positions with Kalman-assisted selection
-        print("Extracting positions with trajectory prediction...")
+        num_chunks = (total_frames + chunk_size - 1) // chunk_size
+
+        for chunk_idx in range(num_chunks):
+            start_frame = chunk_idx * chunk_size
+            print(f"\n=== Processing chunk {chunk_idx + 1}/{num_chunks} (frames {start_frame}-{start_frame + chunk_size}) ===")
+
+            # Read chunk of frames
+            frames = self._read_video_chunk(video_path, start_frame, chunk_size)
+            print(f"  Read {len(frames)} frames")
+
+            # 3. Ball detection for this chunk
+            print("  Detecting balls...")
+            chunk_detections = self._detect_balls_enhanced(frames)
+            all_raw_detections.extend(chunk_detections)
+
+            # 4. Person detection for this chunk
+            if (
+                self.enable_person_detection
+                and self.person_detector
+                and self.person_tracker
+            ):
+                print("  Detecting persons...")
+                chunk_persons = self._detect_and_track_persons_chunk(frames)
+                all_person_detections.extend(chunk_persons)
+
+            # Free memory after processing chunk
+            del frames
+            print(f"  Chunk {chunk_idx + 1} complete, memory freed")
+
+        # Now process all detections (no frames in memory)
+        raw_detections = all_raw_detections
+
+        # 5. Extract primary positions with Kalman-assisted selection
+        print("\nExtracting positions with trajectory prediction...")
         raw_positions = self._extract_positions_with_kalman(raw_detections)
 
-        # 5. Recover missing detections using predicted positions
+        # 6. Recover missing detections using predicted positions
+        # Note: simplified version without frame access
         print("Recovering missing detections...")
-        recovered_positions = self._recover_missing_detections(
-            frames, raw_positions, raw_detections
+        recovered_positions = self._recover_missing_detections_no_frames(
+            raw_positions, raw_detections
         )
 
-        # 6. Interpolate remaining missing positions
+        # 7. Interpolate remaining missing positions
         print("Interpolating remaining gaps...")
         interpolated = self.interpolator.interpolate(recovered_positions)
 
-        # 7. Validate and filter
+        # 8. Validate and filter (simplified without frame access)
         print("Validating detections...")
-        validated_results = self._validate_and_filter(
-            frames, interpolated, raw_detections
+        validated_results = self._validate_and_filter_no_frames(
+            interpolated, raw_detections
         )
 
-        # 8. Detect and track persons
-        person_results = []
+        # 9. Process person tracking results
+        person_results = all_person_detections
         id_mapping = {}
-        if (
-            self.enable_person_detection
-            and self.person_detector
-            and self.person_tracker
-        ):
-            print("Detecting and tracking persons...")
-            person_results = self._detect_and_track_persons(frames)
 
-            # 8.5. Post-process: Merge fragmented person IDs
-            if self.enable_person_id_merge and self.person_id_merger:
-                print("Merging fragmented person IDs...")
-                person_results, id_mapping = self.person_id_merger.merge_ids(
-                    frames, person_results
-                )
-                if id_mapping:
-                    print(f"  ID mapping: {id_mapping}")
+        # 9.5. Shot Detection needs frames - read only required frames
+        shots = []
+        court_aligner = None
+        if court_data:
+            court_aligner = CourtAligner(court_data)
 
-        # 9. Build frame results (balls + persons)
+        # 10. Build frame results (balls + persons)
         frame_results = self._build_frame_results(
             validated_results, video_info.fps, person_results
         )
 
-        # 9.5. Shot Detection & Pose Analysis with Court Alignment
-        shots = []
-        court_aligner = None
+        # 10.5. Shot Detection - process in chunks to save memory
         if self.enable_person_detection and frame_results:
             print("Detecting shots and analyzing poses...")
-            # Initialize court aligner if court_data provided
-            if court_data:
-                court_aligner = CourtAligner(court_data)
             pose_analyzer = PoseAnalyzer()
             shot_detector = ShotDetector(pose_analyzer, court_aligner)
-            shots = shot_detector.detect_shots(frames, frame_results, video_info.fps)
+            shots = self._detect_shots_chunked(
+                video_path, frame_results, video_info.fps, shot_detector, chunk_size
+            )
             print(f"  Detected {len(shots)} shots")
 
         # 10. Calculate statistics
@@ -2429,6 +2449,131 @@ class TennisBallTracker:
 
         return all_person_results
 
+    def _detect_and_track_persons_chunk(self, frames: List[np.ndarray]) -> List[List[Dict]]:
+        """
+        Detect and track persons in a chunk of frames.
+        Similar to _detect_and_track_persons but for chunk processing.
+        """
+        # Batch detect all persons
+        all_detections = self.person_detector.detect_batch(frames, batch_size=self.batch_size)
+
+        # Track persons frame by frame
+        all_person_results = []
+        for frame, detections in zip(frames, all_detections):
+            tracked = self.person_tracker.update(frame, detections)
+            all_person_results.append(tracked)
+
+        return all_person_results
+
+    def _recover_missing_detections_no_frames(
+        self,
+        positions: List[Optional[Tuple[float, float]]],
+        detections: List[List[Dict]],
+    ) -> List[Optional[Tuple[float, float]]]:
+        """
+        Recover missing detections without needing frame access.
+        Uses only Kalman prediction and existing detections.
+        """
+        recovered = list(positions)
+        kalman = BallKalmanFilter()
+        recovery_count = 0
+
+        for i, pos in enumerate(positions):
+            if pos is not None:
+                if not kalman.initialized:
+                    kalman.init(pos[0], pos[1])
+                else:
+                    kalman.predict()
+                    kalman.update(pos[0], pos[1])
+            elif kalman.initialized:
+                pred_x, pred_y = kalman.predict()
+                search_radius = 100
+
+                for det in detections[i]:
+                    dist = math.sqrt(
+                        (det["x"] - pred_x) ** 2 + (det["y"] - pred_y) ** 2
+                    )
+                    if dist < search_radius:
+                        recovered[i] = (det["x"], det["y"])
+                        kalman.update(det["x"], det["y"])
+                        recovery_count += 1
+                        break
+
+        if recovery_count > 0:
+            print(f"  Recovered {recovery_count} missing detections")
+
+        return recovered
+
+    def _validate_and_filter_no_frames(
+        self,
+        interpolated: List[Tuple[Optional[Tuple[float, float]], str]],
+        raw_detections: List[List[Dict]],
+    ) -> List[Dict]:
+        """
+        Validate interpolated positions without frame access.
+        Simplified version that doesn't do pixel-level validation.
+        """
+        results = []
+
+        for i, ((pos, method), frame_dets) in enumerate(
+            zip(interpolated, raw_detections)
+        ):
+            result = {
+                "frame_index": i,
+                "position": pos,
+                "method": method,
+                "validated": pos is not None,
+                "all_detections": frame_dets,
+            }
+            results.append(result)
+
+        return results
+
+    def _detect_shots_chunked(
+        self,
+        video_path: str,
+        frame_results: List[Dict],
+        fps: float,
+        shot_detector,
+        chunk_size: int
+    ) -> List[Dict]:
+        """
+        Detect shots by processing video in chunks to save memory.
+        Only reads frames that are needed for shot detection.
+        """
+        all_shots = []
+        total_frames = len(frame_results)
+        num_chunks = (total_frames + chunk_size - 1) // chunk_size
+
+        for chunk_idx in range(num_chunks):
+            start_frame = chunk_idx * chunk_size
+            end_frame = min(start_frame + chunk_size, total_frames)
+
+            # Read this chunk of frames
+            frames = self._read_video_chunk(video_path, start_frame, end_frame - start_frame)
+
+            # Get corresponding frame results
+            chunk_results = frame_results[start_frame:end_frame]
+
+            # Detect shots in this chunk
+            chunk_shots = shot_detector.detect_shots(frames, chunk_results, fps)
+
+            # Adjust frame indices for shots
+            for shot in chunk_shots:
+                if "frame_index" in shot:
+                    shot["frame_index"] += start_frame
+                if "start_frame" in shot:
+                    shot["start_frame"] += start_frame
+                if "end_frame" in shot:
+                    shot["end_frame"] += start_frame
+
+            all_shots.extend(chunk_shots)
+
+            # Free memory
+            del frames
+
+        return all_shots
+
     def _get_video_info(self, video_path: str) -> VideoInfo:
         """Extract video metadata"""
         cap = cv2.VideoCapture(video_path)
@@ -2457,6 +2602,28 @@ class TennisBallTracker:
             frames.append(frame)
         cap.release()
         return frames
+
+    def _read_video_chunk(self, video_path: str, start_frame: int, num_frames: int) -> List[np.ndarray]:
+        """Read a chunk of frames from video starting at start_frame"""
+        cap = cv2.VideoCapture(video_path)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        frames = []
+        for _ in range(num_frames):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frames.append(frame)
+        cap.release()
+        return frames
+
+    def _create_frame_generator(self, video_path: str, chunk_size: int = 500):
+        """Generator that yields chunks of frames to reduce memory usage"""
+        cap = cv2.VideoCapture(video_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+
+        for start in range(0, total_frames, chunk_size):
+            yield self._read_video_chunk(video_path, start, chunk_size)
 
     def _detect_balls_enhanced(self, frames: List[np.ndarray]) -> List[List[Dict]]:
         """
